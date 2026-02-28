@@ -2,6 +2,9 @@
 import DigitalLoomBackground from "@/components/ui/digital-loom-background";
 import { useState, useRef, useCallback, useEffect } from "react";
 
+// ─────────────────────────────────────────────
+// 타입 정의
+// ─────────────────────────────────────────────
 interface Thought {
   id: number;
   text: string;
@@ -11,10 +14,24 @@ interface Thought {
   vy: number;
   connections: number[];
   color?: string;
-  createdAt?: number;
-  updatedAt?: number;
+  createdAt: number;
+  updatedAt: number;
+  lastFocusedAt: number;
+
+  // 레이어 시스템
+  layer: 0 | 1 | 2;        // FRONT=0, MID=1, BACK=2
+  depthProgress: number;    // 0~1 레이어 내부 진행도
+
+  // 시각 상태 (computed)
+  opacity: number;
+  blur: number;
+  scale: number;
+  saturation: number;
 }
 
+// ─────────────────────────────────────────────
+// 상수
+// ─────────────────────────────────────────────
 const PRESET_COLORS = [
   "rgba(255,255,255,0.12)",
   "rgba(100,100,255,0.25)",
@@ -25,6 +42,48 @@ const PRESET_COLORS = [
   "rgba(80,200,255,0.25)",
 ];
 
+// 레이어 aging 지속 시간 (ms)
+const LAYER_DURATION = {
+  0: 30_000,   // FRONT → MID: 30초
+  1: 120_000,  // MID → BACK: 120초
+  2: Infinity,
+};
+
+// lerp 헬퍼
+const lerp = (a: number, b: number, t: number) => a + (b - a) * Math.min(Math.max(t, 0), 1);
+
+// easeInOutCubic
+const easeInOutCubic = (t: number) =>
+  t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+
+// 레이어별 시각 매핑 (progress 0~1 기준)
+const computeVisuals = (layer: 0 | 1 | 2, progress: number) => {
+  // FRONT: opacity 1→0.7, blur 0→1px, scale 1→0.92
+  // MID:   opacity 0.7→0.45, blur 1→4px, scale 0.92→0.82
+  // BACK:  opacity 0.45→0.25, blur 4→8px, scale 0.82→0.72
+  if (layer === 0) return {
+    opacity: lerp(1.0, 0.7, progress),
+    blur: lerp(0, 1, progress),
+    scale: lerp(1.0, 0.92, progress),
+    saturation: lerp(1.0, 0.85, progress),
+  };
+  if (layer === 1) return {
+    opacity: lerp(0.7, 0.45, progress),
+    blur: lerp(1, 4, progress),
+    scale: lerp(0.92, 0.82, progress),
+    saturation: lerp(0.85, 0.65, progress),
+  };
+  return {
+    opacity: lerp(0.45, 0.25, progress),
+    blur: lerp(4, 8, progress),
+    scale: lerp(0.82, 0.72, progress),
+    saturation: lerp(0.65, 0.55, progress),
+  };
+};
+
+// ─────────────────────────────────────────────
+// 컴포넌트
+// ─────────────────────────────────────────────
 export default function Dashboard() {
   const [, forceRender] = useState(0);
   const [input, setInput] = useState("");
@@ -33,10 +92,11 @@ export default function Dashboard() {
   const [showColorPicker, setShowColorPicker] = useState<number | null>(null);
   const [previewColor, setPreviewColor] = useState<string | null>(null);
   const [deletedThought, setDeletedThought] = useState<{ thought: Thought; index: number } | null>(null);
-    const [hoveredId, setHoveredId] = useState<number | null>(null);
+  const [hoveredId, setHoveredId] = useState<number | null>(null);
   const [selectedId, setSelectedId] = useState<number | null>(null);
-  
-  // 모든 thought 데이터를 ref로 관리 (physics loop에서 직접 수정)
+  const [panelEditText, setPanelEditText] = useState<string>("");
+
+  // ── 기존 refs ──
   const thoughtsRef = useRef<Thought[]>([]);
   const dragging = useRef<{ id: number; offsetX: number; offsetY: number } | null>(null);
   const isDragging = useRef(false);
@@ -49,6 +109,226 @@ export default function Dashboard() {
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const undoTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // ── 깊이/줌 refs ──
+  const depthRef = useRef(0);           // 현재 인지 깊이 0~3
+  const depthTargetRef = useRef(0);     // 목표 깊이
+  const depthVelocityRef = useRef(0);   // 깊이 속도
+  const zoomCanvasRef = useRef<HTMLCanvasElement>(null);
+
+  // ── 입자 풀 ──
+  const particlesRef = useRef<{
+    x: number; y: number;
+    vx: number; vy: number;
+    alpha: number; size: number;
+    life: number;
+  }[]>([]);
+
+  // ── 레이어 전환 상태 ──
+  const transitionRef = useRef<{
+    active: boolean;
+    phase: "compression" | "blurSpike" | "fadeSwap" | "stabilization";
+    progress: number;
+    startTime: number;
+  }>({ active: false, phase: "compression", progress: 0, startTime: 0 });
+
+  // ─────────────────────────────────────────────
+  // 휠 → 깊이 조정
+  // ─────────────────────────────────────────────
+  useEffect(() => {
+    const handleWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const delta = e.deltaY > 0 ? 0.12 : -0.12;
+      depthTargetRef.current = Math.min(2.99, Math.max(0, depthTargetRef.current + delta));
+    };
+    window.addEventListener("wheel", handleWheel, { passive: false });
+    return () => window.removeEventListener("wheel", handleWheel);
+  }, []);
+
+  // ─────────────────────────────────────────────
+  // 줌/깊이/입자/안개 렌더 루프 (독립)
+  // ─────────────────────────────────────────────
+  useEffect(() => {
+    let frameId: number;
+
+    // 입자 풀 초기화
+    particlesRef.current = Array.from({ length: 80 }, () => ({
+      x: Math.random() * window.innerWidth,
+      y: Math.random() * window.innerHeight,
+      vx: 0, vy: 0,
+      alpha: 0,
+      size: Math.random() * 1.5 + 0.5,
+      life: Math.random(),
+    }));
+
+    const depthLoop = () => {
+      const canvas = zoomCanvasRef.current;
+      const ctx = canvas?.getContext("2d");
+      if (!canvas || !ctx) { frameId = requestAnimationFrame(depthLoop); return; }
+
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // ── 비선형 깊이 easing (스프링) ──
+      const diff = depthTargetRef.current - depthRef.current;
+      depthVelocityRef.current = depthVelocityRef.current * 0.75 + diff * 0.04;
+      depthRef.current += depthVelocityRef.current;
+      depthRef.current = Math.min(2.99, Math.max(0, depthRef.current));
+
+      const depth = depthRef.current;
+      const velocity = Math.abs(depthVelocityRef.current);
+      const isMoving = velocity > 0.0002;
+
+      const cx = canvas.width / 2;
+      const cy = canvas.height / 2;
+
+      // ── 레이어 전환 감지 ──
+      const prevLayer = Math.floor(depthRef.current - depthVelocityRef.current);
+      const currLayer = Math.floor(depth);
+      if (prevLayer !== currLayer && !transitionRef.current.active) {
+        transitionRef.current = {
+          active: true,
+          phase: "compression",
+          progress: 0,
+          startTime: performance.now(),
+        };
+      }
+
+      // ── 레이어 전환 효과 처리 ──
+      const tr = transitionRef.current;
+      if (tr.active) {
+        const elapsed = performance.now() - tr.startTime;
+        const totalDuration = 600;
+        const t = Math.min(elapsed / totalDuration, 1);
+
+        if (t < 0.25) {
+          tr.phase = "compression";
+          // compression: 살짝 어두워짐
+          ctx.fillStyle = `rgba(0,0,0,${easeInOutCubic(t / 0.25) * 0.15})`;
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+        } else if (t < 0.5) {
+          tr.phase = "blurSpike";
+          // blur spike: 중심으로 수렴하는 빛
+          const spikeAlpha = easeInOutCubic((t - 0.25) / 0.25) * 0.3;
+          const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.min(canvas.width, canvas.height) * 0.5);
+          g.addColorStop(0, `rgba(150,130,255,${spikeAlpha})`);
+          g.addColorStop(1, `rgba(0,0,0,0)`);
+          ctx.fillStyle = g;
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+        } else if (t < 0.8) {
+          tr.phase = "fadeSwap";
+          // fade swap: 크로스페이드
+          const swapAlpha = (1 - easeInOutCubic((t - 0.5) / 0.3)) * 0.2;
+          ctx.fillStyle = `rgba(5,3,15,${swapAlpha})`;
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+        } else {
+          tr.phase = "stabilization";
+        }
+
+        if (t >= 1) tr.active = false;
+      }
+
+      // ── 터널 왜곡 (렌즈 비네팅) ──
+      if (isMoving) {
+        const distort = Math.min(velocity * 15, 0.5);
+        const vignette = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(canvas.width, canvas.height) * 0.7);
+        vignette.addColorStop(0, `rgba(0,0,0,0)`);
+        vignette.addColorStop(0.55, `rgba(0,0,0,0)`);
+        vignette.addColorStop(1, `rgba(0,0,0,${distort})`);
+        ctx.fillStyle = vignette;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        // 수렴선 (6개)
+        ctx.save();
+        for (let i = 0; i < 6; i++) {
+          const angle = (i / 6) * Math.PI * 2;
+          const ex = cx + Math.cos(angle) * canvas.width;
+          const ey = cy + Math.sin(angle) * canvas.height;
+          const lg = ctx.createLinearGradient(ex, ey, cx, cy);
+          lg.addColorStop(0, `rgba(110,100,255,${distort * 0.15})`);
+          lg.addColorStop(1, `rgba(110,100,255,0)`);
+          ctx.beginPath();
+          ctx.moveTo(ex, ey);
+          ctx.lineTo(cx, cy);
+          ctx.strokeStyle = lg;
+          ctx.lineWidth = 1;
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
+
+      // ── 중심 수렴 입자 ──
+      const spawnRate = velocity * 8;
+      particlesRef.current.forEach((p) => {
+        const dx = cx - p.x;
+        const dy = cy - p.y;
+        const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+
+        if (isMoving) {
+          if (depthVelocityRef.current > 0) {
+            // 줌인: 중심으로
+            p.vx += (dx / dist) * velocity * 10 * 0.09;
+            p.vy += (dy / dist) * velocity * 10 * 0.09;
+          } else {
+            // 줌아웃: 바깥으로
+            p.vx -= (dx / dist) * velocity * 7 * 0.07;
+            p.vy -= (dy / dist) * velocity * 7 * 0.07;
+          }
+          p.alpha = Math.min(p.alpha + spawnRate * 0.03, 0.25);
+        } else {
+          p.alpha = Math.max(p.alpha - 0.008, 0);
+        }
+
+        p.vx *= 0.87;
+        p.vy *= 0.87;
+        p.x += p.vx;
+        p.y += p.vy;
+
+        if (p.x < 0 || p.x > canvas.width || p.y < 0 || p.y > canvas.height || dist < 6) {
+          p.x = Math.random() * canvas.width;
+          p.y = Math.random() * canvas.height;
+          p.vx = 0; p.vy = 0;
+          p.alpha = 0;
+        }
+
+        if (p.alpha > 0.01) {
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+          ctx.fillStyle = `rgba(160,150,255,${p.alpha})`;
+          ctx.fill();
+        }
+      });
+
+      // ── 깊이 안개 ──
+      const fog = depth / 3;
+      if (fog > 0.02) {
+        const haze = lerp(0, 0.32, fog);
+        // 전체 안개
+        ctx.fillStyle = `rgba(8,4,18,${haze * 0.7})`;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        // 중심은 선명하게
+        const clearG = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.min(canvas.width, canvas.height) * 0.38);
+        clearG.addColorStop(0, `rgba(8,4,18,0)`);
+        clearG.addColorStop(1, `rgba(8,4,18,${haze * 0.5})`);
+        ctx.fillStyle = clearG;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      }
+
+      // ── 깊이 숫자 (개발용, 필요시 제거) ──
+      // ctx.fillStyle = "rgba(255,255,255,0.2)";
+      // ctx.font = "11px monospace";
+      // ctx.fillText(`depth: ${depth.toFixed(2)}`, 16, 24);
+
+      frameId = requestAnimationFrame(depthLoop);
+    };
+
+    frameId = requestAnimationFrame(depthLoop);
+    return () => cancelAnimationFrame(frameId);
+  }, []);
+
+  // ─────────────────────────────────────────────
+  // 연결 그룹 탐색 (BFS)
+  // ─────────────────────────────────────────────
   const getConnectedGroup = useCallback((id: number, all: Thought[]): number[] => {
     const visited = new Set<number>();
     const queue = [id];
@@ -56,57 +336,111 @@ export default function Dashboard() {
       const current = queue.shift()!;
       if (visited.has(current)) continue;
       visited.add(current);
-      const thought = all.find((t) => t.id === current);
-      if (thought) thought.connections.forEach((cid) => { if (!visited.has(cid)) queue.push(cid); });
+      const t = all.find((t) => t.id === current);
+      if (t) t.connections.forEach((cid) => { if (!visited.has(cid)) queue.push(cid); });
     }
     return Array.from(visited);
   }, []);
 
-  // 메인 루프: physics + canvas 한 번에
+  // ─────────────────────────────────────────────
+  // 패널 텍스트 동기화
+  // ─────────────────────────────────────────────
+  useEffect(() => {
+    const sel = thoughtsRef.current.find((t) => t.id === selectedId);
+    if (sel) setPanelEditText(sel.text);
+  }, [selectedId]);
+
+  // ─────────────────────────────────────────────
+  // 메인 루프: aging + physics + canvas
+  // ─────────────────────────────────────────────
   useEffect(() => {
     const STIFFNESS = 0.1;
     const DAMPING = 0.80;
     const MIN_DIST = 110;
+    const DENSITY_FACTOR = 0.7;
 
     const loop = () => {
+      const now = Date.now();
       const canvas = canvasRef.current;
       const ctx = canvas?.getContext("2d");
       const thoughts = thoughtsRef.current;
       const leaderId = dragLeaderIdRef.current;
       const leaderPos = leaderPosRef.current;
+      const depth = depthRef.current;
 
-      // --- Physics ---
+      // ── 1. Time Aging ──
+      thoughts.forEach((t) => {
+        const age = now - t.createdAt;
+        let layer: 0 | 1 | 2 = 0;
+        let progress = 0;
+
+        if (age < LAYER_DURATION[0]) {
+          layer = 0;
+          progress = age / LAYER_DURATION[0];
+        } else if (age < LAYER_DURATION[0] + LAYER_DURATION[1]) {
+          layer = 1;
+          progress = (age - LAYER_DURATION[0]) / LAYER_DURATION[1];
+        } else {
+          layer = 2;
+          progress = Math.min((age - LAYER_DURATION[0] - LAYER_DURATION[1]) / 60_000, 1);
+        }
+
+        t.layer = layer;
+        t.depthProgress = progress;
+
+        // 선택/포커스된 노드는 aging 완화
+        const isFocused = t.id === selectedId;
+        const focusBoost = isFocused ? 0.4 : 0;
+
+        const visuals = computeVisuals(layer, progress);
+        t.opacity = Math.min(visuals.opacity + focusBoost, 1.0);
+        t.blur = isFocused ? 0 : visuals.blur;
+        t.scale = visuals.scale + (isFocused ? 0.08 : 0);
+        t.saturation = visuals.saturation + (isFocused ? 0.3 : 0);
+      });
+
+      // ── 2. Cognitive Filtering (깊이 기반 노드 가시성) ──
+      const baseCount = thoughts.length;
+      const maxVisible = Math.max(
+        3,
+        Math.round(baseCount * Math.exp(-depth * DENSITY_FACTOR))
+      );
+
+      // 우선순위: focused → connected → cluster → background
+      const connectedGroup = selectedId ? getConnectedGroup(selectedId, thoughts) : [];
+      const sorted = [...thoughts].sort((a, b) => {
+        const scoreA = a.id === selectedId ? 4
+          : connectedGroup.includes(a.id) ? 3
+          : a.layer === 0 ? 2 : 1;
+        const scoreB = b.id === selectedId ? 4
+          : connectedGroup.includes(b.id) ? 3
+          : b.layer === 0 ? 2 : 1;
+        return scoreB - scoreA;
+      });
+      const visibleIds = new Set(sorted.slice(0, maxVisible).map((t) => t.id));
+
+      // ── 3. Physics ──
       if (leaderId && leaderPos) {
         const group = getConnectedGroup(leaderId, thoughts);
-
         thoughts.forEach((t) => {
           if (t.id === leaderId) {
-            t.x = leaderPos.x;
-            t.y = leaderPos.y;
-            t.vx = 0;
-            t.vy = 0;
+            t.x = leaderPos.x; t.y = leaderPos.y;
+            t.vx = 0; t.vy = 0;
             return;
           }
-
           if (group.includes(t.id)) {
             const dx = leaderPos.x - t.x;
             const dy = leaderPos.y - t.y;
             const dist = Math.sqrt(dx * dx + dy * dy);
             const groupRadius = 160;
-
-            let fx = 0;
-            let fy = 0;
-
+            let fx = 0, fy = 0;
             if (dist > groupRadius) {
               const ratio = (dist - groupRadius) / dist;
               fx += dx * ratio * STIFFNESS;
               fy += dy * ratio * STIFFNESS;
             }
-
-            // 멤버 간 반발
             thoughts.forEach((other) => {
-              if (other.id === t.id) return;
-              if (!group.includes(other.id)) return;
+              if (other.id === t.id || !group.includes(other.id)) return;
               const rx = t.x - other.x;
               const ry = t.y - other.y;
               const rd = Math.sqrt(rx * rx + ry * ry);
@@ -115,66 +449,67 @@ export default function Dashboard() {
                 fy += (ry / rd) * (MIN_DIST - rd) * 0.05;
               }
             });
-
             t.vx = (t.vx + fx) * DAMPING;
             t.vy = (t.vy + fy) * DAMPING;
             t.x += t.vx;
             t.y += t.vy;
           }
-
-          // 비그룹 충돌 반발
           if (!group.includes(t.id)) {
             thoughts.forEach((other) => {
-              if (other.id === t.id) return;
-              if (group.includes(other.id)) {
-                const rx = t.x - other.x;
-                const ry = t.y - other.y;
-                const rd = Math.sqrt(rx * rx + ry * ry);
-                if (rd < MIN_DIST && rd > 0) {
-                  const force = (MIN_DIST - rd) / rd * 0.3;
-                  t.x += rx * force;
-                  t.y += ry * force;
-                }
+              if (other.id === t.id || !group.includes(other.id)) return;
+              const rx = t.x - other.x;
+              const ry = t.y - other.y;
+              const rd = Math.sqrt(rx * rx + ry * ry);
+              if (rd < MIN_DIST && rd > 0) {
+                const force = (MIN_DIST - rd) / rd * 0.3;
+                t.x += rx * force;
+                t.y += ry * force;
               }
             });
           }
         });
-
         forceRender((n) => n + 1);
       }
 
-      // --- Canvas ---
+      // ── 4. Canvas 연결선 렌더 ──
       if (canvas && ctx) {
         canvas.width = window.innerWidth;
         canvas.height = window.innerHeight;
         ctx.clearRect(0, 0, canvas.width, canvas.height);
-        const now = Date.now() / 1000;
+        const nowSec = now / 1000;
 
         thoughts.forEach((thought) => {
+          if (!visibleIds.has(thought.id)) return;
           thought.connections.forEach((targetId) => {
             const target = thoughts.find((t) => t.id === targetId);
-            if (!target || targetId < thought.id) return;
-            const x1 = thought.x + 40;
-            const y1 = thought.y + 16;
-            const x2 = target.x + 40;
-            const y2 = target.y + 16;
+            if (!target || targetId < thought.id || !visibleIds.has(targetId)) return;
+
+            const x1 = thought.x + 40, y1 = thought.y + 16;
+            const x2 = target.x + 40, y2 = target.y + 16;
             const len = Math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2);
             if (len < 1) return;
             const dx = (x2 - x1) / len;
             const dy = (y2 - y1) / len;
             const density = Math.max(8, Math.floor(len / 18));
             const speed = 60;
+
+            // 연결선 opacity는 두 노드 평균 opacity
+            const lineOpacity = (thought.opacity + target.opacity) / 2;
+
             for (let i = 0; i < density; i++) {
               const phase = i / density;
-              const t = ((now * speed / len) + phase) % 1;
+              const t = ((nowSec * speed / len) + phase) % 1;
               const px = x1 + dx * len * t;
               const py = y1 + dy * len * t;
-              const distFromCenter = Math.abs(t - 0.5) * 2;
-              const alpha = 0.2 + (1 - distFromCenter) * 0.5;
-              const vibration = Math.sin(now * 2.5 + i * 1.2) * 0.8;
+              const dfc = Math.abs(t - 0.5) * 2;
+              const alpha = (0.2 + (1 - dfc) * 0.5) * lineOpacity;
+              const vibration = Math.sin(nowSec * 2.5 + i * 1.2) * 0.8;
               const perpX = -dy * vibration;
               const perpY = dx * vibration;
-              const gradient = ctx.createRadialGradient(px + perpX, py + perpY, 0, px + perpX, py + perpY, 3.5);
+              const gradient = ctx.createRadialGradient(
+                px + perpX, py + perpY, 0,
+                px + perpX, py + perpY, 3.5
+              );
               gradient.addColorStop(0, `rgba(200,200,255,${alpha})`);
               gradient.addColorStop(1, `rgba(100,100,255,0)`);
               ctx.beginPath();
@@ -191,12 +526,14 @@ export default function Dashboard() {
 
     animFrameRef.current = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(animFrameRef.current);
-  }, [getConnectedGroup]);
+  }, [getConnectedGroup, selectedId]);
 
-  // ESC + Ctrl+Z
+  // ─────────────────────────────────────────────
+  // 키보드: ESC + Ctrl+Z
+  // ─────────────────────────────────────────────
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") { setConnecting(null); setShowColorPicker(null); }
+      if (e.key === "Escape") { setConnecting(null); setShowColorPicker(null); setSelectedId(null); }
       if ((e.ctrlKey || e.metaKey) && e.key === "z" && deletedThought) {
         thoughtsRef.current.splice(deletedThought.index, 0, deletedThought.thought);
         setDeletedThought(null);
@@ -208,22 +545,36 @@ export default function Dashboard() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [deletedThought]);
 
+  // ─────────────────────────────────────────────
+  // Thought 추가
+  // ─────────────────────────────────────────────
   const addThought = () => {
     if (!input.trim()) return;
+    const now = Date.now();
     thoughtsRef.current.push({
-      id: Date.now(),
+      id: now,
       text: input,
       x: 200 + Math.random() * (window.innerWidth - 400),
       y: 100 + Math.random() * (window.innerHeight - 200),
       vx: 0, vy: 0,
       connections: [],
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
+      createdAt: now,
+      updatedAt: now,
+      lastFocusedAt: now,
+      layer: 0,
+      depthProgress: 0,
+      opacity: 1,
+      blur: 0,
+      scale: 1,
+      saturation: 1,
     });
     setInput("");
     forceRender((n) => n + 1);
   };
 
+  // ─────────────────────────────────────────────
+  // 드래그
+  // ─────────────────────────────────────────────
   const handleMouseDown = useCallback((e: React.MouseEvent, thought: Thought) => {
     e.stopPropagation();
     isDragging.current = false;
@@ -235,30 +586,30 @@ export default function Dashboard() {
     leaderPosRef.current = { x: thought.x, y: thought.y };
     dragging.current = { id: thought.id, offsetX: e.clientX - thought.x, offsetY: e.clientY - thought.y };
 
-    const handleMouseMove = (e: MouseEvent) => {
+    const onMove = (e: MouseEvent) => {
       if (!dragging.current) return;
       isDragging.current = true;
       const { offsetX, offsetY } = dragging.current;
       leaderPosRef.current = { x: e.clientX - offsetX, y: e.clientY - offsetY };
     };
-
-    const handleMouseUp = () => {
+    const onUp = () => {
       isDragging.current = false;
       dragLeaderIdRef.current = null;
       leaderPosRef.current = null;
       dragging.current = null;
-      window.removeEventListener("mousemove", handleMouseMove);
-      window.removeEventListener("mouseup", handleMouseUp);
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
     };
-
-    window.addEventListener("mousemove", handleMouseMove);
-    window.addEventListener("mouseup", handleMouseUp);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
   }, []);
 
+  // ─────────────────────────────────────────────
+  // 연결
+  // ─────────────────────────────────────────────
   const handleConnect = useCallback((fromId: number, toId: number) => {
     if (fromId === toId) return;
-    const thoughts = thoughtsRef.current;
-    thoughts.forEach((t) => {
+    thoughtsRef.current.forEach((t) => {
       if (t.id === fromId) {
         const already = t.connections.includes(toId);
         t.connections = already ? t.connections.filter((c) => c !== toId) : [...t.connections, toId];
@@ -270,8 +621,11 @@ export default function Dashboard() {
     });
     setConnecting(null);
     forceRender((n) => n + 1);
-}, []);
+  }, []);
 
+  // ─────────────────────────────────────────────
+  // 클릭
+  // ─────────────────────────────────────────────
   const handleThoughtClick = useCallback((thought: Thought) => {
     if (isDragging.current) return;
     const now = Date.now();
@@ -285,9 +639,7 @@ export default function Dashboard() {
   const handleMouseEnter = useCallback((thought: Thought) => {
     if (hideTimer.current) clearTimeout(hideTimer.current);
     if (longHoverTimer.current) clearTimeout(longHoverTimer.current);
-    longHoverTimer.current = setTimeout(() => {
-      setLongHoverId(thought.id);
-    }, 700);
+    longHoverTimer.current = setTimeout(() => setLongHoverId(thought.id), 700);
   }, []);
 
   const handleMouseLeave = useCallback(() => {
@@ -300,12 +652,16 @@ export default function Dashboard() {
     }, 200);
   }, []);
 
+  // ─────────────────────────────────────────────
+  // 삭제 / 색상 / 그룹 해제
+  // ─────────────────────────────────────────────
   const handleDelete = useCallback((thought: Thought) => {
     const index = thoughtsRef.current.findIndex((t) => t.id === thought.id);
     setDeletedThought({ thought, index });
     thoughtsRef.current = thoughtsRef.current.filter((t) => t.id !== thought.id);
     setLongHoverId(null);
     setShowColorPicker(null);
+    setSelectedId(null);
     forceRender((n) => n + 1);
     if (undoTimer.current) clearTimeout(undoTimer.current);
     undoTimer.current = setTimeout(() => setDeletedThought(null), 3000);
@@ -328,15 +684,9 @@ export default function Dashboard() {
     forceRender((n) => n + 1);
   }, []);
 
-  // 패널용 편집 상태
-  const [panelEditText, setPanelEditText] = useState<string>("");
-
-  // selectedId 변경 시 편집 텍스트 동기화
-  useEffect(() => {
-    const selected = thoughtsRef.current.find((t) => t.id === selectedId);
-    if (selected) setPanelEditText(selected.text);
-  }, [selectedId]);
-
+  // ─────────────────────────────────────────────
+  // 패널 핸들러
+  // ─────────────────────────────────────────────
   const handlePanelTextSave = useCallback(() => {
     const t = thoughtsRef.current.find((t) => t.id === selectedId);
     if (t && panelEditText.trim()) {
@@ -349,6 +699,7 @@ export default function Dashboard() {
   const handlePanelFocus = useCallback((targetId: number) => {
     const target = thoughtsRef.current.find((t) => t.id === targetId);
     if (!target) return;
+    target.lastFocusedAt = Date.now();
     setSelectedId(targetId);
   }, []);
 
@@ -357,6 +708,9 @@ export default function Dashboard() {
     return new Date(ts).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
   };
 
+  // ─────────────────────────────────────────────
+  // 파생 데이터
+  // ─────────────────────────────────────────────
   const selectedThought = thoughtsRef.current.find((t) => t.id === selectedId) ?? null;
   const connectedThoughts = selectedThought
     ? thoughtsRef.current.filter((t) => selectedThought.connections.includes(t.id))
@@ -370,35 +724,66 @@ export default function Dashboard() {
 
   const thoughts = thoughtsRef.current;
 
+  // ─────────────────────────────────────────────
+  // 렌더
+  // ─────────────────────────────────────────────
   return (
     <div className="w-screen h-screen overflow-hidden relative bg-black">
+
+      {/* 배경 */}
       <div className="absolute inset-0 pointer-events-none">
         <DigitalLoomBackground threadColor="rgba(100, 100, 255, 0.05)" threadCount={30}>
           <div />
         </DigitalLoomBackground>
       </div>
 
-<canvas ref={canvasRef} className="absolute inset-0 w-full h-full pointer-events-none z-10" />
+      {/* 연결선 캔버스 */}
+      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full pointer-events-none z-10" />
 
-      {/* 빈 공간 클릭 시 패널 닫기 */}
+      {/* 깊이/안개/입자 캔버스 */}
+      <canvas ref={zoomCanvasRef} className="fixed inset-0 w-full h-full pointer-events-none z-50" />
+
+      {/* 빈 공간 클릭 → 패널 닫기 */}
       {selectedId !== null && (
-        <div
-          className="fixed inset-0 z-10"
-          onClick={() => setSelectedId(null)}
-        />
+        <div className="fixed inset-0 z-10" onClick={() => setSelectedId(null)} />
       )}
+
+      {/* Thought 카드 목록 */}
       {thoughts.map((thought) => {
         const isLongHovered = longHoverId === thought.id;
-        const currentColor = previewColor && isLongHovered ? previewColor : (thought.color || "rgba(255,255,255,0.1)");
+        const isSelected = selectedId === thought.id;
+        const isHovered = hoveredId === thought.id;
+        const currentColor = previewColor && isLongHovered
+          ? previewColor
+          : (thought.color || "rgba(255,255,255,0.1)");
+
+        // 시각 상태 적용
+        const visualOpacity = isSelected ? 1 : thought.opacity;
+        const visualBlur = isSelected ? 0 : thought.blur;
+        const visualScale = isSelected
+          ? 1.08
+          : isHovered
+          ? Math.max(thought.scale, 1.0) * 1.06
+          : isLongHovered
+          ? thought.scale * 1.04
+          : thought.scale;
+        const visualSaturation = thought.saturation;
 
         return (
           <div
             key={thought.id}
             className="absolute z-20"
-            style={{ left: thought.x, top: thought.y }}
+            style={{
+              left: thought.x,
+              top: thought.y,
+              opacity: visualOpacity,
+              filter: `blur(${visualBlur}px) saturate(${visualSaturation})`,
+              transition: "opacity 1.2s ease, filter 1.2s ease",
+            }}
             onMouseEnter={() => handleMouseEnter(thought)}
             onMouseLeave={handleMouseLeave}
           >
+            {/* 퀵 액션 */}
             {isLongHovered && (
               <div
                 className="absolute -top-9 left-0 flex gap-1 z-30"
@@ -416,15 +801,13 @@ export default function Dashboard() {
                       <path d="M10 11v6M14 11v6"/>
                     </svg>
                   </button>
-
                   <div className="relative">
                     <button
                       onClick={(e) => { e.stopPropagation(); setShowColorPicker(showColorPicker === thought.id ? null : thought.id); }}
                       className="w-6 h-6 rounded-lg flex items-center justify-center text-white/50 hover:text-purple-400 hover:bg-purple-500/20 transition-all hover:scale-110 active:scale-95"
                     >
                       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <circle cx="12" cy="12" r="10"/>
-                        <circle cx="12" cy="12" r="4"/>
+                        <circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="4"/>
                       </svg>
                     </button>
                     {showColorPicker === thought.id && (
@@ -447,7 +830,6 @@ export default function Dashboard() {
                       </div>
                     )}
                   </div>
-
                   <button
                     onClick={(e) => { e.stopPropagation(); handleUngroup(thought); }}
                     className="w-6 h-6 rounded-lg flex items-center justify-center text-white/50 hover:text-orange-400 hover:bg-orange-500/20 transition-all hover:scale-110 active:scale-95"
@@ -462,8 +844,9 @@ export default function Dashboard() {
               </div>
             )}
 
+            {/* 카드 본체 */}
             <div
-              className={`backdrop-blur-sm border rounded-2xl px-4 py-2 text-white text-sm select-none transition-all duration-150 ${
+              className={`backdrop-blur-sm border rounded-2xl px-4 py-2 text-white text-sm select-none ${
                 connecting === thought.id
                   ? "border-blue-400/50 cursor-crosshair"
                   : connecting !== null
@@ -472,14 +855,8 @@ export default function Dashboard() {
               }`}
               style={{
                 background: currentColor,
-                transform: selectedId === thought.id
-                  ? "scale(1.08)"
-                  : hoveredId === thought.id
-                  ? "scale(1.06)"
-                  : isLongHovered
-                  ? "scale(1.04)"
-                  : "scale(1)",
-                boxShadow: selectedId === thought.id
+                transform: `scale(${visualScale})`,
+                boxShadow: isSelected
                   ? `0 0 16px 4px ${thought.color
                       ? thought.color.replace(/[\d.]+\)$/, "0.5)")
                       : "rgba(100,100,255,0.45)"}`
@@ -491,6 +868,9 @@ export default function Dashboard() {
               }}
               onMouseDown={(e) => {
                 setSelectedId(thought.id);
+                // 포커스 시간 갱신 (aging 완화)
+                const t = thoughtsRef.current.find((t) => t.id === thought.id);
+                if (t) t.lastFocusedAt = Date.now();
                 handleMouseDown(e, thought);
               }}
               onClick={() => handleThoughtClick(thought)}
@@ -506,18 +886,21 @@ export default function Dashboard() {
         );
       })}
 
+      {/* 연결 모드 안내 */}
       {connecting !== null && (
         <div className="fixed top-6 left-1/2 -translate-x-1/2 z-50 backdrop-blur-md bg-blue-500/20 border border-blue-400/30 rounded-full px-6 py-2 text-blue-200 text-sm">
           Click another thought to connect · ESC to cancel
         </div>
       )}
 
+      {/* Undo 안내 */}
       {deletedThought && (
         <div className="fixed bottom-24 left-1/2 -translate-x-1/2 z-50 backdrop-blur-md bg-white/10 border border-white/20 rounded-full px-5 py-2 text-white/50 text-xs">
           Ctrl+Z to undo
         </div>
       )}
 
+      {/* 입력창 */}
       <div className="fixed bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-3 backdrop-blur-md bg-white/5 border border-white/10 rounded-full px-6 py-3 w-96 z-30">
         <input
           type="text"
@@ -543,17 +926,26 @@ export default function Dashboard() {
       >
         {selectedThought && (
           <div className="pointer-events-auto h-full flex flex-col gap-4 p-5 border-l border-white/10 bg-black/60 backdrop-blur-xl overflow-y-auto">
-            
-            {/* 헤더 */}
             <div className="flex items-center justify-between">
               <span className="text-white/30 text-xs tracking-widest uppercase">Detail</span>
-              <button
-                onClick={() => setSelectedId(null)}
-                className="text-white/30 hover:text-white/70 transition-colors text-lg leading-none"
-              >×</button>
+              <button onClick={() => setSelectedId(null)} className="text-white/30 hover:text-white/70 transition-colors text-lg leading-none">×</button>
             </div>
 
-            {/* 텍스트 편집 */}
+            {/* 레이어 배지 */}
+            <div className="flex gap-2 items-center">
+              {(["FRONT", "MID", "BACK"] as const).map((label, i) => (
+                <span
+                  key={label}
+                  className="text-xs px-2 py-0.5 rounded-full border"
+                  style={{
+                    borderColor: selectedThought.layer === i ? "rgba(150,130,255,0.5)" : "rgba(255,255,255,0.08)",
+                    color: selectedThought.layer === i ? "rgba(200,185,255,0.9)" : "rgba(255,255,255,0.2)",
+                    background: selectedThought.layer === i ? "rgba(120,100,255,0.15)" : "transparent",
+                  }}
+                >{label}</span>
+              ))}
+            </div>
+
             <div className="flex flex-col gap-2">
               <span className="text-white/30 text-xs">Content</span>
               <textarea
@@ -566,7 +958,6 @@ export default function Dashboard() {
               />
             </div>
 
-            {/* 생성/수정 시간 */}
             <div className="flex flex-col gap-1.5">
               <span className="text-white/30 text-xs">Info</span>
               <div className="flex justify-between text-xs text-white/40">
@@ -577,7 +968,6 @@ export default function Dashboard() {
               </div>
             </div>
 
-            {/* 연결된 Thought */}
             <div className="flex flex-col gap-2">
               <span className="text-white/30 text-xs">
                 Connections <span className="text-white/20">({connectedThoughts.length})</span>
@@ -587,17 +977,15 @@ export default function Dashboard() {
               ) : (
                 <div className="flex flex-col gap-1">
                   {connectedThoughts.map((t) => (
-                    <button
-                      key={t.id}
-                      onClick={() => handlePanelFocus(t.id)}
-                      className="text-left px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 text-white/60 text-xs hover:text-white hover:bg-white/10 transition-all"
-                    >{t.text}</button>
+                    <button key={t.id} onClick={() => handlePanelFocus(t.id)}
+                      className="text-left px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 text-white/60 text-xs hover:text-white hover:bg-white/10 transition-all">
+                      {t.text}
+                    </button>
                   ))}
                 </div>
               )}
             </div>
 
-            {/* 그룹 정보 */}
             {groupThoughts.length > 0 && (
               <div className="flex flex-col gap-2">
                 <span className="text-white/30 text-xs">
@@ -605,39 +993,32 @@ export default function Dashboard() {
                 </span>
                 <div className="flex flex-col gap-1">
                   {groupThoughts.map((t) => (
-                    <button
-                      key={t.id}
-                      onClick={() => handlePanelFocus(t.id)}
-                      className="text-left px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 text-white/40 text-xs hover:text-white/70 hover:bg-white/10 transition-all"
-                    >{t.text}</button>
+                    <button key={t.id} onClick={() => handlePanelFocus(t.id)}
+                      className="text-left px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 text-white/40 text-xs hover:text-white/70 hover:bg-white/10 transition-all">
+                      {t.text}
+                    </button>
                   ))}
                 </div>
               </div>
             )}
 
-            {/* 색상 변경 */}
             <div className="flex flex-col gap-2">
               <span className="text-white/30 text-xs">Color</span>
               <div className="flex gap-1.5 flex-wrap">
                 {PRESET_COLORS.map((color) => (
-                  <button
-                    key={color}
-                    onClick={() => handleColorChange(selectedThought.id, color)}
+                  <button key={color} onClick={() => handleColorChange(selectedThought.id, color)}
                     className="w-5 h-5 rounded-full border border-white/20 hover:scale-125 transition-transform"
-                    style={{ background: color }}
-                  />
+                    style={{ background: color }} />
                 ))}
               </div>
             </div>
 
-            {/* 삭제 */}
             <div className="mt-auto pt-4 border-t border-white/10">
-              <button
-                onClick={() => handleDelete(selectedThought)}
-                className="w-full py-2 rounded-xl text-white/30 hover:text-red-400 hover:bg-red-500/10 border border-white/10 hover:border-red-500/20 text-xs transition-all"
-              >Delete thought</button>
+              <button onClick={() => handleDelete(selectedThought)}
+                className="w-full py-2 rounded-xl text-white/30 hover:text-red-400 hover:bg-red-500/10 border border-white/10 hover:border-red-500/20 text-xs transition-all">
+                Delete thought
+              </button>
             </div>
-
           </div>
         )}
       </div>
