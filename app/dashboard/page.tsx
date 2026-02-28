@@ -11,6 +11,8 @@ interface Thought {
   vy: number;
   connections: number[];
   color?: string;
+  createdAt?: number;
+  updatedAt?: number;
 }
 
 const PRESET_COLORS = [
@@ -31,7 +33,7 @@ export default function Dashboard() {
   const [showColorPicker, setShowColorPicker] = useState<number | null>(null);
   const [previewColor, setPreviewColor] = useState<string | null>(null);
   const [deletedThought, setDeletedThought] = useState<{ thought: Thought; index: number } | null>(null);
-  const [hoveredId, setHoveredId] = useState<number | null>(null);
+    const [hoveredId, setHoveredId] = useState<number | null>(null);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   
   // 모든 thought 데이터를 ref로 관리 (physics loop에서 직접 수정)
@@ -215,6 +217,8 @@ export default function Dashboard() {
       y: 100 + Math.random() * (window.innerHeight - 200),
       vx: 0, vy: 0,
       connections: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
     });
     setInput("");
     forceRender((n) => n + 1);
@@ -324,6 +328,46 @@ export default function Dashboard() {
     forceRender((n) => n + 1);
   }, []);
 
+  // 패널용 편집 상태
+  const [panelEditText, setPanelEditText] = useState<string>("");
+
+  // selectedId 변경 시 편집 텍스트 동기화
+  useEffect(() => {
+    const selected = thoughtsRef.current.find((t) => t.id === selectedId);
+    if (selected) setPanelEditText(selected.text);
+  }, [selectedId]);
+
+  const handlePanelTextSave = useCallback(() => {
+    const t = thoughtsRef.current.find((t) => t.id === selectedId);
+    if (t && panelEditText.trim()) {
+      t.text = panelEditText.trim();
+      t.updatedAt = Date.now();
+      forceRender((n) => n + 1);
+    }
+  }, [selectedId, panelEditText]);
+
+  const handlePanelFocus = useCallback((targetId: number) => {
+    const target = thoughtsRef.current.find((t) => t.id === targetId);
+    if (!target) return;
+    setSelectedId(targetId);
+  }, []);
+
+  const formatTime = (ts?: number) => {
+    if (!ts) return "—";
+    return new Date(ts).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
+  };
+
+  const selectedThought = thoughtsRef.current.find((t) => t.id === selectedId) ?? null;
+  const connectedThoughts = selectedThought
+    ? thoughtsRef.current.filter((t) => selectedThought.connections.includes(t.id))
+    : [];
+  const groupIds = selectedThought
+    ? getConnectedGroup(selectedThought.id, thoughtsRef.current)
+    : [];
+  const groupThoughts = thoughtsRef.current.filter(
+    (t) => groupIds.includes(t.id) && t.id !== selectedThought?.id
+  );
+
   const thoughts = thoughtsRef.current;
 
   return (
@@ -334,8 +378,15 @@ export default function Dashboard() {
         </DigitalLoomBackground>
       </div>
 
-      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full pointer-events-none z-10" />
+<canvas ref={canvasRef} className="absolute inset-0 w-full h-full pointer-events-none z-10" />
 
+      {/* 빈 공간 클릭 시 패널 닫기 */}
+      {selectedId !== null && (
+        <div
+          className="fixed inset-0 z-10"
+          onClick={() => setSelectedId(null)}
+        />
+      )}
       {thoughts.map((thought) => {
         const isLongHovered = longHoverId === thought.id;
         const currentColor = previewColor && isLongHovered ? previewColor : (thought.color || "rgba(255,255,255,0.1)");
@@ -429,24 +480,22 @@ export default function Dashboard() {
                   ? "scale(1.04)"
                   : "scale(1)",
                 boxShadow: selectedId === thought.id
-                  ? `0 0 16px 4px ${thought.color ? thought.color.replace(/[\d.]+\)$/, "0.5)") : "rgba(100,100,255,0.45)"}`
+                  ? `0 0 16px 4px ${thought.color
+                      ? thought.color.replace(/[\d.]+\)$/, "0.5)")
+                      : "rgba(100,100,255,0.45)"}`
                   : isLongHovered
                   ? "0 0 18px rgba(100,100,255,0.25)"
                   : "none",
                 transition: "transform 180ms ease-out, box-shadow 220ms ease-out",
                 animation: "float 4s ease-in-out infinite",
               }}
-
               onMouseDown={(e) => {
                 setSelectedId(thought.id);
                 handleMouseDown(e, thought);
               }}
-              onClick={() => {
-                handleThoughtClick(thought);
-              }}
-              
-              onMouseEnter={(e) => { void e; setHoveredId(thought.id); }}
-              onMouseLeave={(e) => { void e; setHoveredId(null); }}
+              onClick={() => handleThoughtClick(thought)}
+              onMouseEnter={() => setHoveredId(thought.id)}
+              onMouseLeave={() => setHoveredId(null)}
             >
               {thought.text}
               {connecting === thought.id && (
@@ -482,6 +531,115 @@ export default function Dashboard() {
           className="bg-transparent text-white placeholder-gray-500 outline-none flex-1 text-sm"
         />
         <button onClick={addThought} className="text-white/60 hover:text-white transition-colors text-sm">＋</button>
+      </div>
+
+      {/* 우측 상세 패널 */}
+      <div
+        className="fixed top-0 right-0 h-full w-72 z-40 pointer-events-none"
+        style={{
+          transform: selectedThought ? "translateX(0)" : "translateX(100%)",
+          transition: "transform 250ms cubic-bezier(0.4,0,0.2,1)",
+        }}
+      >
+        {selectedThought && (
+          <div className="pointer-events-auto h-full flex flex-col gap-4 p-5 border-l border-white/10 bg-black/60 backdrop-blur-xl overflow-y-auto">
+            
+            {/* 헤더 */}
+            <div className="flex items-center justify-between">
+              <span className="text-white/30 text-xs tracking-widest uppercase">Detail</span>
+              <button
+                onClick={() => setSelectedId(null)}
+                className="text-white/30 hover:text-white/70 transition-colors text-lg leading-none"
+              >×</button>
+            </div>
+
+            {/* 텍스트 편집 */}
+            <div className="flex flex-col gap-2">
+              <span className="text-white/30 text-xs">Content</span>
+              <textarea
+                value={panelEditText}
+                onChange={(e) => setPanelEditText(e.target.value)}
+                onBlur={handlePanelTextSave}
+                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handlePanelTextSave(); } }}
+                className="bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-white text-sm outline-none resize-none focus:border-white/25 transition-colors"
+                rows={3}
+              />
+            </div>
+
+            {/* 생성/수정 시간 */}
+            <div className="flex flex-col gap-1.5">
+              <span className="text-white/30 text-xs">Info</span>
+              <div className="flex justify-between text-xs text-white/40">
+                <span>Created</span><span>{formatTime(selectedThought.createdAt)}</span>
+              </div>
+              <div className="flex justify-between text-xs text-white/40">
+                <span>Updated</span><span>{formatTime(selectedThought.updatedAt)}</span>
+              </div>
+            </div>
+
+            {/* 연결된 Thought */}
+            <div className="flex flex-col gap-2">
+              <span className="text-white/30 text-xs">
+                Connections <span className="text-white/20">({connectedThoughts.length})</span>
+              </span>
+              {connectedThoughts.length === 0 ? (
+                <span className="text-white/20 text-xs">None</span>
+              ) : (
+                <div className="flex flex-col gap-1">
+                  {connectedThoughts.map((t) => (
+                    <button
+                      key={t.id}
+                      onClick={() => handlePanelFocus(t.id)}
+                      className="text-left px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 text-white/60 text-xs hover:text-white hover:bg-white/10 transition-all"
+                    >{t.text}</button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* 그룹 정보 */}
+            {groupThoughts.length > 0 && (
+              <div className="flex flex-col gap-2">
+                <span className="text-white/30 text-xs">
+                  Group <span className="text-white/20">({groupIds.length} nodes)</span>
+                </span>
+                <div className="flex flex-col gap-1">
+                  {groupThoughts.map((t) => (
+                    <button
+                      key={t.id}
+                      onClick={() => handlePanelFocus(t.id)}
+                      className="text-left px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 text-white/40 text-xs hover:text-white/70 hover:bg-white/10 transition-all"
+                    >{t.text}</button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* 색상 변경 */}
+            <div className="flex flex-col gap-2">
+              <span className="text-white/30 text-xs">Color</span>
+              <div className="flex gap-1.5 flex-wrap">
+                {PRESET_COLORS.map((color) => (
+                  <button
+                    key={color}
+                    onClick={() => handleColorChange(selectedThought.id, color)}
+                    className="w-5 h-5 rounded-full border border-white/20 hover:scale-125 transition-transform"
+                    style={{ background: color }}
+                  />
+                ))}
+              </div>
+            </div>
+
+            {/* 삭제 */}
+            <div className="mt-auto pt-4 border-t border-white/10">
+              <button
+                onClick={() => handleDelete(selectedThought)}
+                className="w-full py-2 rounded-xl text-white/30 hover:text-red-400 hover:bg-red-500/10 border border-white/10 hover:border-red-500/20 text-xs transition-all"
+              >Delete thought</button>
+            </div>
+
+          </div>
+        )}
       </div>
 
       <style jsx global>{`
