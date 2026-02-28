@@ -2,13 +2,17 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import DigitalLoomBackground from "@/components/ui/digital-loom-background";
-import { supabase } from "@/lib/supabase";
+import { createBrowserClient } from "@supabase/ssr";
 
 export default function LoginPage() {
   const [hovered, setHovered] = useState(false);
   const router = useRouter();
 
   const handleGoogleLogin = async () => {
+    const supabase = createBrowserClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+    );
     await supabase.auth.signInWithOAuth({
       provider: "google",
       options: {
@@ -19,7 +23,6 @@ export default function LoginPage() {
 
   return (
     <DigitalLoomBackground>
-      {/* 뒤로가기 버튼 */}
       <button
         onClick={() => router.push("/")}
         className="fixed top-6 left-6 flex items-center gap-2 text-gray-400 hover:text-white transition-colors z-50"
@@ -27,7 +30,6 @@ export default function LoginPage() {
         ← Back
       </button>
 
-      {/* 카드 박스 */}
       <div className="w-full max-w-xl mx-auto px-4">
         <div
           className="backdrop-blur-sm bg-white/5 border border-white/10 rounded-3xl p-16 shadow-2xl flex flex-col items-center"
@@ -36,23 +38,19 @@ export default function LoginPage() {
               "0 0 40px rgba(255,255,255,0.05), 0 25px 50px rgba(0,0,0,0.5)",
           }}
         >
-          {/* 뱃지 */}
           <div className="inline-block backdrop-blur-md bg-white/10 border border-white/10 rounded-full px-4 py-1 text-xs text-gray-400 mb-8 tracking-widest uppercase">
             Second Brain
           </div>
 
-          {/* 제목 */}
           <h1 className="text-3xl font-black text-white text-center tracking-tighter mb-4">
             Welcome Back to Your Second Brain
           </h1>
 
-          {/* 설명 */}
           <p className="text-gray-500 text-sm text-center mb-10 leading-relaxed">
             Your thoughts are waiting. Log in to continue organizing,
             connecting, and thinking clearly.
           </p>
 
-          {/* Google 로그인 버튼 */}
           <button
             onClick={handleGoogleLogin}
             onMouseEnter={() => setHovered(true)}
