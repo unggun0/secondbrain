@@ -95,9 +95,11 @@ className="text-5xl font-bold tracking-tight text-white sm:text-7xl md:text-8xl 
           custom={3}
           className="mt-12 flex items-center justify-center gap-x-6"
         >
-          <button className="rounded-full bg-white px-8 py-4 text-lg font-semibold text-black shadow-lg shadow-white/20 transition-transform hover:scale-105">
-            Build Your Second Brain
-          </button>
+          <a href="/login">
+  <button className="rounded-full bg-white px-8 py-4 text-lg font-semibold text-black shadow-lg shadow-white/20 transition-transform hover:scale-105">
+    Build Your Second Brain
+  </button>
+</a>
         </motion.div>
       </div>
     </DigitalLoomBackground>
