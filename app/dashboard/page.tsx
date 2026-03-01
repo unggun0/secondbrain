@@ -80,6 +80,9 @@ export default function Dashboard() {
   const [panelEditText, setPanelEditText] = useState<string>("");
   const [hudLayer, setHudLayer] = useState<LayerIndex>(0);
   const [hudVisible, setHudVisible] = useState(true);
+  const [bgOpacity, setBgOpacity] = useState(0.85);
+  const bgOpacityRef = useRef(0.85);       // lerp용 실제값
+  const bgOpacityTargetRef = useRef(0.85); // 슬라이더 목표값
 
   // ── Parallax Starfield 캔버스 ──
   const starCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -274,7 +277,10 @@ export default function Dashboard() {
         const sprite = glowSprites[si];
         const drawSize = finalSize * sprite.r * (cam < 1 ? 2.8 : lerp(2.8, 4.5, Math.min(cam - 1, 1)));
 
-        ctx.globalAlpha = Math.min(finalAlpha * depthFade, 1.0);
+        // bgOpacity lerp (슬라이더 부드럽게 반영)
+        bgOpacityRef.current = lerp(bgOpacityRef.current, bgOpacityTargetRef.current, 0.06);
+        const finalOpacity = Math.min(finalAlpha * depthFade * bgOpacityRef.current, 1.0);
+        ctx.globalAlpha = finalOpacity;
         ctx.drawImage(
           sprite.canvas,
           sx - drawSize, sy - drawSize,
@@ -433,6 +439,36 @@ export default function Dashboard() {
         return sb - sa;
       });
       const visibleIds = new Set(sorted.slice(0, maxVisible).map((t) => t.id));
+
+      // 항상 작동: 모든 노드 간 반발 (부드럽게 밀리기)
+      thoughts.forEach((t) => {
+        if (t.id === dragLeaderIdRef.current) return;
+        let fx = 0, fy = 0;
+        thoughts.forEach((o) => {
+          if (o.id === t.id) return;
+          const rx = t.x - o.x, ry = t.y - o.y;
+          const rd = Math.sqrt(rx * rx + ry * ry);
+          if (rd < MIN_DIST && rd > 0) {
+            const force = (MIN_DIST - rd) / rd * 0.018;
+            fx += rx * force; fy += ry * force;
+          }
+        });
+        t.vx = (t.vx + fx) * DAMPING;
+        t.vy = (t.vy + fy) * DAMPING;
+        t.x += t.vx; t.y += t.vy;
+        // 화면 경계 바운스
+      const margin = 60;
+        if (t.x < margin) { t.x = margin; t.vx *= -0.3; }
+        if (t.x > window.innerWidth - margin) { t.x = window.innerWidth - margin; t.vx *= -0.3; }
+        if (t.y < margin) { t.y = margin; t.vy *= -0.3; }
+        if (t.y > window.innerHeight - margin) { t.y = window.innerHeight - margin; t.vy *= -0.3; }
+      });
+
+    
+
+      // 반발 움직임 있을 때만 리렌더
+      const hasMotion = thoughts.some(t => Math.abs(t.vx) > 0.01 || Math.abs(t.vy) > 0.01);
+      if (hasMotion) forceRender((n) => n + 1);
 
       // Physics
       if (leaderId && leaderPos) {
@@ -726,6 +762,31 @@ export default function Dashboard() {
             </div>
           )}
 
+          {/* Ambient 컨트롤러 */}
+          <div className="fixed bottom-8 left-8 z-30 flex flex-col gap-2 opacity-20 hover:opacity-100 transition-opacity duration-500">
+            <span className="text-[9px] uppercase tracking-[0.25em] text-white/40 font-light">Ambient</span>
+            <div className="flex items-center gap-3">
+              <input
+                type="range" min="0" max="1" step="0.01"
+                value={bgOpacity}
+                onChange={(e) => {
+                  const v = parseFloat(e.target.value);
+                  setBgOpacity(v);
+                  bgOpacityTargetRef.current = v;
+                }}
+                className="w-20 cursor-pointer"
+                style={{
+                  WebkitAppearance: "none",
+                  appearance: "none",
+                  height: "1px",
+                  background: `linear-gradient(to right, rgba(255,255,255,0.7) ${bgOpacity * 100}%, rgba(255,255,255,0.15) ${bgOpacity * 100}%)`,
+                  outline: "none",
+                  border: "none",
+                }}
+              />
+            </div>
+          </div>
+
           {/* 입력창 */}
           <div className="fixed bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-3 backdrop-blur-md bg-white/5 border border-white/10 rounded-full px-6 py-3 w-96 z-30">
             <input type="text" value={input} onChange={(e) => setInput(e.target.value)}
@@ -808,6 +869,21 @@ export default function Dashboard() {
         @keyframes scrollDot {
           0%, 100% { transform: translateY(0); opacity: 0.4; }
           50% { transform: translateY(6px); opacity: 0.9; }
+        }
+        input[type=range]::-webkit-slider-thumb {
+          -webkit-appearance: none;
+          width: 8px; height: 8px;
+          border-radius: 50%;
+          background: rgba(255,255,255,0.9);
+          cursor: pointer;
+          box-shadow: 0 0 6px rgba(255,255,255,0.5);
+        }
+        input[type=range]::-moz-range-thumb {
+          width: 8px; height: 8px;
+          border-radius: 50%;
+          background: rgba(255,255,255,0.9);
+          border: none;
+          cursor: pointer;
         }
       `}</style>
     </div>
