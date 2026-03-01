@@ -1,5 +1,4 @@
 "use client";
-import DigitalLoomBackground from "@/components/ui/digital-loom-background";
 import { useState, useRef, useCallback, useEffect } from "react";
 
 // ─────────────────────────────────────────────
@@ -17,12 +16,8 @@ interface Thought {
   createdAt: number;
   updatedAt: number;
   lastFocusedAt: number;
-
-  // 레이어 시스템
-  layer: 0 | 1 | 2;        // FRONT=0, MID=1, BACK=2
-  depthProgress: number;    // 0~1 레이어 내부 진행도
-
-  // 시각 상태 (computed)
+  layer: 0 | 1 | 2;
+  depthProgress: number;
   opacity: number;
   blur: number;
   scale: number;
@@ -42,25 +37,23 @@ const PRESET_COLORS = [
   "rgba(80,200,255,0.25)",
 ];
 
-// 레이어 aging 지속 시간 (ms)
 const LAYER_DURATION = {
-  0: 30_000,   // FRONT → MID: 30초
-  1: 120_000,  // MID → BACK: 120초
+  0: 30_000,
+  1: 120_000,
   2: Infinity,
 };
 
-// lerp 헬퍼
-const lerp = (a: number, b: number, t: number) => a + (b - a) * Math.min(Math.max(t, 0), 1);
+// ── 레이어 이름 ──
+const LAYER_NAMES = ["Active", "Emerging", "Abyssal"] as const;
+type LayerIndex = 0 | 1 | 2;
 
-// easeInOutCubic
+const lerp = (a: number, b: number, t: number) =>
+  a + (b - a) * Math.min(Math.max(t, 0), 1);
+
 const easeInOutCubic = (t: number) =>
   t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
 
-// 레이어별 시각 매핑 (progress 0~1 기준)
-const computeVisuals = (layer: 0 | 1 | 2, progress: number) => {
-  // FRONT: opacity 1→0.7, blur 0→1px, scale 1→0.92
-  // MID:   opacity 0.7→0.45, blur 1→4px, scale 0.92→0.82
-  // BACK:  opacity 0.45→0.25, blur 4→8px, scale 0.82→0.72
+const computeVisuals = (layer: LayerIndex, progress: number) => {
   if (layer === 0) return {
     opacity: lerp(1.0, 0.7, progress),
     blur: lerp(0, 1, progress),
@@ -96,6 +89,13 @@ export default function Dashboard() {
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [panelEditText, setPanelEditText] = useState<string>("");
 
+  // ── 2️⃣ HUD 상태 ──
+  const [hudLayer, setHudLayer] = useState<LayerIndex>(0);
+  const [hudVisible, setHudVisible] = useState(true);
+
+  // ── 카메라 현재 레이어 ref (렌더 루프에서 직접 읽기용) ──
+  const camLayerRef = useRef<LayerIndex>(0);
+
   // ── 기존 refs ──
   const thoughtsRef = useRef<Thought[]>([]);
   const dragging = useRef<{ id: number; offsetX: number; offsetY: number } | null>(null);
@@ -109,13 +109,15 @@ export default function Dashboard() {
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const undoTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // ── 깊이/줌 refs ──
-  const depthRef = useRef(0);           // 현재 인지 깊이 0~3
-  const depthTargetRef = useRef(0);     // 목표 깊이
-  const depthVelocityRef = useRef(0);   // 깊이 속도
+  // ── 1️⃣ 깊이 이동 refs ──
+  // camDepth: 0.0~2.99 (0~1=Active, 1~2=Emerging, 2~3=Abyssal)
+  const camDepthRef = useRef(0);       // 현재 카메라 깊이
+  const camTargetRef = useRef(0);      // 목표 깊이 (휠로 조정)
+  const camVelRef = useRef(0);         // 스프링 속도
   const zoomCanvasRef = useRef<HTMLCanvasElement>(null);
+  const prevCamLayerRef = useRef<LayerIndex>(0);
 
-  // ── 입자 풀 ──
+  // 입자
   const particlesRef = useRef<{
     x: number; y: number;
     vx: number; vy: number;
@@ -123,174 +125,154 @@ export default function Dashboard() {
     life: number;
   }[]>([]);
 
-  // ── 레이어 전환 상태 ──
-  const transitionRef = useRef<{
-    active: boolean;
-    phase: "compression" | "blurSpike" | "fadeSwap" | "stabilization";
-    progress: number;
-    startTime: number;
-  }>({ active: false, phase: "compression", progress: 0, startTime: 0 });
+  // 레이어 전환 충격
+  const transitionRef = useRef({
+    active: false, phase: 0, startTime: 0,
+  });
 
   // ─────────────────────────────────────────────
-  // 휠 → 깊이 조정
+  // 1️⃣ 휠 → 카메라 목표 깊이 조정
+  //   휠 위(deltaY 음수) = 더 깊이(depth 증가)
+  //   휠 아래(deltaY 양수) = 바깥(depth 감소)
   // ─────────────────────────────────────────────
   useEffect(() => {
-    const handleWheel = (e: WheelEvent) => {
+    const onWheel = (e: WheelEvent) => {
       e.preventDefault();
-      const delta = e.deltaY > 0 ? 0.12 : -0.12;
-      depthTargetRef.current = Math.min(2.99, Math.max(0, depthTargetRef.current + delta));
+      // 위 = 더 깊이 = depth 증가
+      const delta = e.deltaY > 0 ? -0.15 : 0.15;
+      camTargetRef.current = Math.min(2.99, Math.max(0, camTargetRef.current + delta));
     };
-    window.addEventListener("wheel", handleWheel, { passive: false });
-    return () => window.removeEventListener("wheel", handleWheel);
+    window.addEventListener("wheel", onWheel, { passive: false });
+    return () => window.removeEventListener("wheel", onWheel);
   }, []);
 
   // ─────────────────────────────────────────────
-  // 줌/깊이/입자/안개 렌더 루프 (독립)
+  // 효과 캔버스 루프 (카메라 스프링 + 비네팅 + 입자 + 안개)
   // ─────────────────────────────────────────────
   useEffect(() => {
-    let frameId: number;
+    let fid: number;
 
-    // 입자 풀 초기화
     particlesRef.current = Array.from({ length: 80 }, () => ({
-      x: Math.random() * window.innerWidth,
-      y: Math.random() * window.innerHeight,
-      vx: 0, vy: 0,
-      alpha: 0,
+      x: Math.random() * (window.innerWidth || 1200),
+      y: Math.random() * (window.innerHeight || 800),
+      vx: 0, vy: 0, alpha: 0,
       size: Math.random() * 1.5 + 0.5,
       life: Math.random(),
     }));
 
-    const depthLoop = () => {
+    const loop = () => {
       const canvas = zoomCanvasRef.current;
       const ctx = canvas?.getContext("2d");
-      if (!canvas || !ctx) { frameId = requestAnimationFrame(depthLoop); return; }
+      if (!canvas || !ctx) { fid = requestAnimationFrame(loop); return; }
 
       canvas.width = window.innerWidth;
       canvas.height = window.innerHeight;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      // ── 비선형 깊이 easing (스프링) ──
-      const diff = depthTargetRef.current - depthRef.current;
-      depthVelocityRef.current = depthVelocityRef.current * 0.75 + diff * 0.04;
-      depthRef.current += depthVelocityRef.current;
-      depthRef.current = Math.min(2.99, Math.max(0, depthRef.current));
+      // ── 스프링 기반 카메라 이동 (easeInOut 느낌) ──
+      const diff = camTargetRef.current - camDepthRef.current;
+      camVelRef.current = camVelRef.current * 0.75 + diff * 0.04;
+      camDepthRef.current = Math.min(2.99, Math.max(0,
+        camDepthRef.current + camVelRef.current
+      ));
 
-      const depth = depthRef.current;
-      const velocity = Math.abs(depthVelocityRef.current);
-      const isMoving = velocity > 0.0002;
+      const cam = camDepthRef.current;
+      const speed = Math.abs(camVelRef.current);
+      const moving = speed > 0.0002;
 
       const cx = canvas.width / 2;
       const cy = canvas.height / 2;
 
-      // ── 레이어 전환 감지 ──
-      const prevLayer = Math.floor(depthRef.current - depthVelocityRef.current);
-      const currLayer = Math.floor(depth);
-      if (prevLayer !== currLayer && !transitionRef.current.active) {
-        transitionRef.current = {
-          active: true,
-          phase: "compression",
-          progress: 0,
-          startTime: performance.now(),
-        };
+      // ── 레이어 전환 감지 → HUD 업데이트 ──
+      const camLayer = Math.floor(cam) as LayerIndex;
+      if (camLayer !== prevCamLayerRef.current) {
+        prevCamLayerRef.current = camLayer;
+        camLayerRef.current = camLayer;
+        transitionRef.current = { active: true, phase: 0, startTime: performance.now() };
+
+        // HUD fade 처리
+        setHudVisible(false);
+        setTimeout(() => {
+          setHudLayer(camLayer);
+          setHudVisible(true);
+        }, 120);
       }
 
-      // ── 레이어 전환 효과 처리 ──
-      const tr = transitionRef.current;
-      if (tr.active) {
-        const elapsed = performance.now() - tr.startTime;
-        const totalDuration = 600;
-        const t = Math.min(elapsed / totalDuration, 1);
-
+      // ── 레이어 전환 충격 효과 ──
+      if (transitionRef.current.active) {
+        const elapsed = performance.now() - transitionRef.current.startTime;
+        const t = Math.min(elapsed / 600, 1);
         if (t < 0.25) {
-          tr.phase = "compression";
-          // compression: 살짝 어두워짐
           ctx.fillStyle = `rgba(0,0,0,${easeInOutCubic(t / 0.25) * 0.15})`;
           ctx.fillRect(0, 0, canvas.width, canvas.height);
         } else if (t < 0.5) {
-          tr.phase = "blurSpike";
-          // blur spike: 중심으로 수렴하는 빛
-          const spikeAlpha = easeInOutCubic((t - 0.25) / 0.25) * 0.3;
-          const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.min(canvas.width, canvas.height) * 0.5);
+          const spikeAlpha = easeInOutCubic((t - 0.25) / 0.25) * 0.28;
+          const g = ctx.createRadialGradient(cx, cy, 0, cx, cy,
+            Math.min(canvas.width, canvas.height) * 0.5);
           g.addColorStop(0, `rgba(150,130,255,${spikeAlpha})`);
           g.addColorStop(1, `rgba(0,0,0,0)`);
           ctx.fillStyle = g;
           ctx.fillRect(0, 0, canvas.width, canvas.height);
         } else if (t < 0.8) {
-          tr.phase = "fadeSwap";
-          // fade swap: 크로스페이드
-          const swapAlpha = (1 - easeInOutCubic((t - 0.5) / 0.3)) * 0.2;
+          const swapAlpha = (1 - easeInOutCubic((t - 0.5) / 0.3)) * 0.18;
           ctx.fillStyle = `rgba(5,3,15,${swapAlpha})`;
           ctx.fillRect(0, 0, canvas.width, canvas.height);
-        } else {
-          tr.phase = "stabilization";
         }
-
-        if (t >= 1) tr.active = false;
+        if (t >= 1) transitionRef.current.active = false;
       }
 
-      // ── 터널 왜곡 (렌즈 비네팅) ──
-      if (isMoving) {
-        const distort = Math.min(velocity * 15, 0.5);
-        const vignette = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.max(canvas.width, canvas.height) * 0.7);
-        vignette.addColorStop(0, `rgba(0,0,0,0)`);
-        vignette.addColorStop(0.55, `rgba(0,0,0,0)`);
-        vignette.addColorStop(1, `rgba(0,0,0,${distort})`);
-        ctx.fillStyle = vignette;
+      // ── 비네팅 + 수렴선 (이동 중) ──
+      if (moving) {
+        const v = Math.min(speed * 14, 0.48);
+        const vig = ctx.createRadialGradient(cx, cy, 0, cx, cy,
+          Math.max(canvas.width, canvas.height) * 0.7);
+        vig.addColorStop(0, `rgba(0,0,0,0)`);
+        vig.addColorStop(0.55, `rgba(0,0,0,0)`);
+        vig.addColorStop(1, `rgba(0,0,0,${v})`);
+        ctx.fillStyle = vig;
         ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-        // 수렴선 (6개)
         ctx.save();
+        const goingDeep = camVelRef.current > 0;
         for (let i = 0; i < 6; i++) {
           const angle = (i / 6) * Math.PI * 2;
           const ex = cx + Math.cos(angle) * canvas.width;
           const ey = cy + Math.sin(angle) * canvas.height;
           const lg = ctx.createLinearGradient(ex, ey, cx, cy);
-          lg.addColorStop(0, `rgba(110,100,255,${distort * 0.15})`);
+          lg.addColorStop(0, `rgba(110,100,255,${v * (goingDeep ? 0.15 : 0.07)})`);
           lg.addColorStop(1, `rgba(110,100,255,0)`);
           ctx.beginPath();
-          ctx.moveTo(ex, ey);
-          ctx.lineTo(cx, cy);
-          ctx.strokeStyle = lg;
-          ctx.lineWidth = 1;
-          ctx.stroke();
+          ctx.moveTo(ex, ey); ctx.lineTo(cx, cy);
+          ctx.strokeStyle = lg; ctx.lineWidth = 1; ctx.stroke();
         }
         ctx.restore();
       }
 
-      // ── 중심 수렴 입자 ──
-      const spawnRate = velocity * 8;
+      // ── 입자 흐름 ──
+      const spawnRate = speed * 8;
       particlesRef.current.forEach((p) => {
         const dx = cx - p.x;
         const dy = cy - p.y;
         const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-
-        if (isMoving) {
-          if (depthVelocityRef.current > 0) {
-            // 줌인: 중심으로
-            p.vx += (dx / dist) * velocity * 10 * 0.09;
-            p.vy += (dy / dist) * velocity * 10 * 0.09;
+        if (moving) {
+          if (camVelRef.current > 0) {
+            p.vx += (dx / dist) * speed * 10 * 0.09;
+            p.vy += (dy / dist) * speed * 10 * 0.09;
           } else {
-            // 줌아웃: 바깥으로
-            p.vx -= (dx / dist) * velocity * 7 * 0.07;
-            p.vy -= (dy / dist) * velocity * 7 * 0.07;
+            p.vx -= (dx / dist) * speed * 7 * 0.07;
+            p.vy -= (dy / dist) * speed * 7 * 0.07;
           }
           p.alpha = Math.min(p.alpha + spawnRate * 0.03, 0.25);
         } else {
           p.alpha = Math.max(p.alpha - 0.008, 0);
         }
-
-        p.vx *= 0.87;
-        p.vy *= 0.87;
-        p.x += p.vx;
-        p.y += p.vy;
-
+        p.vx *= 0.87; p.vy *= 0.87;
+        p.x += p.vx; p.y += p.vy;
         if (p.x < 0 || p.x > canvas.width || p.y < 0 || p.y > canvas.height || dist < 6) {
           p.x = Math.random() * canvas.width;
           p.y = Math.random() * canvas.height;
-          p.vx = 0; p.vy = 0;
-          p.alpha = 0;
+          p.vx = 0; p.vy = 0; p.alpha = 0;
         }
-
         if (p.alpha > 0.01) {
           ctx.beginPath();
           ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
@@ -300,58 +282,50 @@ export default function Dashboard() {
       });
 
       // ── 깊이 안개 ──
-      const fog = depth / 3;
+      const fog = cam / 3;
       if (fog > 0.02) {
         const haze = lerp(0, 0.32, fog);
-        // 전체 안개
         ctx.fillStyle = `rgba(8,4,18,${haze * 0.7})`;
         ctx.fillRect(0, 0, canvas.width, canvas.height);
-        // 중심은 선명하게
-        const clearG = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.min(canvas.width, canvas.height) * 0.38);
+        const clearG = ctx.createRadialGradient(cx, cy, 0, cx, cy,
+          Math.min(canvas.width, canvas.height) * 0.38);
         clearG.addColorStop(0, `rgba(8,4,18,0)`);
         clearG.addColorStop(1, `rgba(8,4,18,${haze * 0.5})`);
         ctx.fillStyle = clearG;
         ctx.fillRect(0, 0, canvas.width, canvas.height);
       }
 
-      // ── 깊이 숫자 (개발용, 필요시 제거) ──
-      // ctx.fillStyle = "rgba(255,255,255,0.2)";
-      // ctx.font = "11px monospace";
-      // ctx.fillText(`depth: ${depth.toFixed(2)}`, 16, 24);
-
-      frameId = requestAnimationFrame(depthLoop);
+      fid = requestAnimationFrame(loop);
     };
 
-    frameId = requestAnimationFrame(depthLoop);
-    return () => cancelAnimationFrame(frameId);
+    fid = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(fid);
   }, []);
 
   // ─────────────────────────────────────────────
-  // 연결 그룹 탐색 (BFS)
+  // BFS
   // ─────────────────────────────────────────────
   const getConnectedGroup = useCallback((id: number, all: Thought[]): number[] => {
     const visited = new Set<number>();
     const queue = [id];
     while (queue.length > 0) {
-      const current = queue.shift()!;
-      if (visited.has(current)) continue;
-      visited.add(current);
-      const t = all.find((t) => t.id === current);
-      if (t) t.connections.forEach((cid) => { if (!visited.has(cid)) queue.push(cid); });
+      const cur = queue.shift()!;
+      if (visited.has(cur)) continue;
+      visited.add(cur);
+      const t = all.find((t) => t.id === cur);
+      if (t) t.connections.forEach((c) => { if (!visited.has(c)) queue.push(c); });
     }
     return Array.from(visited);
   }, []);
 
-  // ─────────────────────────────────────────────
   // 패널 텍스트 동기화
-  // ─────────────────────────────────────────────
   useEffect(() => {
     const sel = thoughtsRef.current.find((t) => t.id === selectedId);
     if (sel) setPanelEditText(sel.text);
   }, [selectedId]);
 
   // ─────────────────────────────────────────────
-  // 메인 루프: aging + physics + canvas
+  // 메인 루프: aging + radial push + physics + canvas
   // ─────────────────────────────────────────────
   useEffect(() => {
     const STIFFNESS = 0.1;
@@ -366,104 +340,101 @@ export default function Dashboard() {
       const thoughts = thoughtsRef.current;
       const leaderId = dragLeaderIdRef.current;
       const leaderPos = leaderPosRef.current;
-      const depth = depthRef.current;
+      const cam = camDepthRef.current;
+      const camSpeed = Math.abs(camVelRef.current);
 
-      // ── 1. Time Aging ──
+      const W = window.innerWidth;
+      const H = window.innerHeight;
+      const cx = W / 2;
+      const cy = H / 2;
+
+      // ── 1. Aging ──
       thoughts.forEach((t) => {
         const age = now - t.createdAt;
-        let layer: 0 | 1 | 2 = 0;
+        let layer: LayerIndex = 0;
         let progress = 0;
-
         if (age < LAYER_DURATION[0]) {
-          layer = 0;
-          progress = age / LAYER_DURATION[0];
+          layer = 0; progress = age / LAYER_DURATION[0];
         } else if (age < LAYER_DURATION[0] + LAYER_DURATION[1]) {
-          layer = 1;
-          progress = (age - LAYER_DURATION[0]) / LAYER_DURATION[1];
+          layer = 1; progress = (age - LAYER_DURATION[0]) / LAYER_DURATION[1];
         } else {
-          layer = 2;
-          progress = Math.min((age - LAYER_DURATION[0] - LAYER_DURATION[1]) / 60_000, 1);
+          layer = 2; progress = Math.min((age - LAYER_DURATION[0] - LAYER_DURATION[1]) / 60_000, 1);
         }
-
         t.layer = layer;
         t.depthProgress = progress;
 
-        // 선택/포커스된 노드는 aging 완화
         const isFocused = t.id === selectedId;
-        const focusBoost = isFocused ? 0.4 : 0;
-
         const visuals = computeVisuals(layer, progress);
-        t.opacity = Math.min(visuals.opacity + focusBoost, 1.0);
+        t.opacity = Math.min(visuals.opacity + (isFocused ? 0.4 : 0), 1.0);
         t.blur = isFocused ? 0 : visuals.blur;
         t.scale = visuals.scale + (isFocused ? 0.08 : 0);
         t.saturation = visuals.saturation + (isFocused ? 0.3 : 0);
       });
 
-      // ── 2. Cognitive Filtering (깊이 기반 노드 가시성) ──
-      const baseCount = thoughts.length;
-      const maxVisible = Math.max(
-        3,
-        Math.round(baseCount * Math.exp(-depth * DENSITY_FACTOR))
-      );
+      // ── 2. Radial Push: 카메라 이동 시 현재 레이어 노드를 중심 바깥으로 밀어냄 ──
+      if (camSpeed > 0.0003) {
+        const camLayer = Math.floor(cam) as LayerIndex;
+        thoughts.forEach((t) => {
+          if (t.layer !== camLayer) return;
+          const dx = t.x - cx;
+          const dy = t.y - cy;
+          const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+          // camVelRef > 0 = 깊이 진입 → 현재 레이어 바깥으로 밀림
+          const pushForce = camVelRef.current * 38 * (1 - t.depthProgress * 0.5);
+          t.x += (dx / dist) * pushForce;
+          t.y += (dy / dist) * pushForce;
+        });
+      }
 
-      // 우선순위: focused → connected → cluster → background
-      const connectedGroup = selectedId ? getConnectedGroup(selectedId, thoughts) : [];
+      // ── 3. Cognitive Filtering (깊이 기반 노드 가시성) ──
+      const depth = cam;
+      const baseCount = thoughts.length;
+      const maxVisible = Math.max(3, Math.round(baseCount * Math.exp(-depth * DENSITY_FACTOR)));
+      const connGroup = selectedId ? getConnectedGroup(selectedId, thoughts) : [];
       const sorted = [...thoughts].sort((a, b) => {
-        const scoreA = a.id === selectedId ? 4
-          : connectedGroup.includes(a.id) ? 3
-          : a.layer === 0 ? 2 : 1;
-        const scoreB = b.id === selectedId ? 4
-          : connectedGroup.includes(b.id) ? 3
-          : b.layer === 0 ? 2 : 1;
-        return scoreB - scoreA;
+        const sa = a.id === selectedId ? 4 : connGroup.includes(a.id) ? 3 : a.layer === 0 ? 2 : 1;
+        const sb = b.id === selectedId ? 4 : connGroup.includes(b.id) ? 3 : b.layer === 0 ? 2 : 1;
+        return sb - sa;
       });
       const visibleIds = new Set(sorted.slice(0, maxVisible).map((t) => t.id));
 
-      // ── 3. Physics ──
+      // ── 4. Physics ──
       if (leaderId && leaderPos) {
         const group = getConnectedGroup(leaderId, thoughts);
         thoughts.forEach((t) => {
           if (t.id === leaderId) {
-            t.x = leaderPos.x; t.y = leaderPos.y;
-            t.vx = 0; t.vy = 0;
-            return;
+            t.x = leaderPos.x; t.y = leaderPos.y; t.vx = 0; t.vy = 0; return;
           }
           if (group.includes(t.id)) {
             const dx = leaderPos.x - t.x;
             const dy = leaderPos.y - t.y;
             const dist = Math.sqrt(dx * dx + dy * dy);
-            const groupRadius = 160;
             let fx = 0, fy = 0;
-            if (dist > groupRadius) {
-              const ratio = (dist - groupRadius) / dist;
+            if (dist > 160) {
+              const ratio = (dist - 160) / dist;
               fx += dx * ratio * STIFFNESS;
               fy += dy * ratio * STIFFNESS;
             }
             thoughts.forEach((other) => {
               if (other.id === t.id || !group.includes(other.id)) return;
-              const rx = t.x - other.x;
-              const ry = t.y - other.y;
+              const rx = t.x - other.x; const ry = t.y - other.y;
               const rd = Math.sqrt(rx * rx + ry * ry);
               if (rd < MIN_DIST && rd > 0) {
                 fx += (rx / rd) * (MIN_DIST - rd) * 0.05;
                 fy += (ry / rd) * (MIN_DIST - rd) * 0.05;
               }
             });
-            t.vx = (t.vx + fx) * DAMPING;
-            t.vy = (t.vy + fy) * DAMPING;
-            t.x += t.vx;
-            t.y += t.vy;
+            t.vx = (t.vx + fx) * DAMPING; t.vy = (t.vy + fy) * DAMPING;
+            t.x += t.vx; t.y += t.vy;
           }
           if (!group.includes(t.id)) {
             thoughts.forEach((other) => {
               if (other.id === t.id || !group.includes(other.id)) return;
-              const rx = t.x - other.x;
-              const ry = t.y - other.y;
+              const rx = t.x - other.x; const ry = t.y - other.y;
               const rd = Math.sqrt(rx * rx + ry * ry);
               if (rd < MIN_DIST && rd > 0) {
-                const force = (MIN_DIST - rd) / rd * 0.3;
-                t.x += rx * force;
-                t.y += ry * force;
+                t.x += rx * (MIN_DIST - rd) / rd * 0.3;
+                t.y += ry * (MIN_DIST - rd) / rd * 0.3;
               }
             });
           }
@@ -471,51 +442,41 @@ export default function Dashboard() {
         forceRender((n) => n + 1);
       }
 
-      // ── 4. Canvas 연결선 렌더 ──
+      // ── 5. Canvas 연결선 ──
       if (canvas && ctx) {
-        canvas.width = window.innerWidth;
-        canvas.height = window.innerHeight;
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        const nowSec = now / 1000;
+        canvas.width = W; canvas.height = H;
+        ctx.clearRect(0, 0, W, H);
+        const ns = now / 1000;
 
         thoughts.forEach((thought) => {
           if (!visibleIds.has(thought.id)) return;
-          thought.connections.forEach((targetId) => {
-            const target = thoughts.find((t) => t.id === targetId);
-            if (!target || targetId < thought.id || !visibleIds.has(targetId)) return;
-
+          thought.connections.forEach((tid) => {
+            const tg = thoughts.find((t) => t.id === tid);
+            if (!tg || tid < thought.id || !visibleIds.has(tid)) return;
             const x1 = thought.x + 40, y1 = thought.y + 16;
-            const x2 = target.x + 40, y2 = target.y + 16;
+            const x2 = tg.x + 40, y2 = tg.y + 16;
             const len = Math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2);
             if (len < 1) return;
-            const dx = (x2 - x1) / len;
-            const dy = (y2 - y1) / len;
+            const dx = (x2 - x1) / len, dy = (y2 - y1) / len;
             const density = Math.max(8, Math.floor(len / 18));
-            const speed = 60;
-
-            // 연결선 opacity는 두 노드 평균 opacity
-            const lineOpacity = (thought.opacity + target.opacity) / 2;
-
+            const lineOp = (thought.opacity + tg.opacity) / 2;
             for (let i = 0; i < density; i++) {
               const phase = i / density;
-              const t = ((nowSec * speed / len) + phase) % 1;
+              const t = ((ns * 60 / len) + phase) % 1;
               const px = x1 + dx * len * t;
               const py = y1 + dy * len * t;
               const dfc = Math.abs(t - 0.5) * 2;
-              const alpha = (0.2 + (1 - dfc) * 0.5) * lineOpacity;
-              const vibration = Math.sin(nowSec * 2.5 + i * 1.2) * 0.8;
-              const perpX = -dy * vibration;
-              const perpY = dx * vibration;
-              const gradient = ctx.createRadialGradient(
-                px + perpX, py + perpY, 0,
-                px + perpX, py + perpY, 3.5
+              const alpha = (0.2 + (1 - dfc) * 0.5) * lineOp;
+              const vib = Math.sin(ns * 2.5 + i * 1.2) * 0.8;
+              const grd = ctx.createRadialGradient(
+                px - dy * vib, py + dx * vib, 0,
+                px - dy * vib, py + dx * vib, 3.5
               );
-              gradient.addColorStop(0, `rgba(200,200,255,${alpha})`);
-              gradient.addColorStop(1, `rgba(100,100,255,0)`);
+              grd.addColorStop(0, `rgba(200,200,255,${alpha})`);
+              grd.addColorStop(1, `rgba(100,100,255,0)`);
               ctx.beginPath();
-              ctx.arc(px + perpX, py + perpY, 3.5, 0, Math.PI * 2);
-              ctx.fillStyle = gradient;
-              ctx.fill();
+              ctx.arc(px - dy * vib, py + dx * vib, 3.5, 0, Math.PI * 2);
+              ctx.fillStyle = grd; ctx.fill();
             }
           });
         });
@@ -529,20 +490,19 @@ export default function Dashboard() {
   }, [getConnectedGroup, selectedId]);
 
   // ─────────────────────────────────────────────
-  // 키보드: ESC + Ctrl+Z
+  // 키보드
   // ─────────────────────────────────────────────
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
+    const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") { setConnecting(null); setShowColorPicker(null); setSelectedId(null); }
       if ((e.ctrlKey || e.metaKey) && e.key === "z" && deletedThought) {
         thoughtsRef.current.splice(deletedThought.index, 0, deletedThought.thought);
-        setDeletedThought(null);
-        forceRender((n) => n + 1);
+        setDeletedThought(null); forceRender((n) => n + 1);
         if (undoTimer.current) clearTimeout(undoTimer.current);
       }
     };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, [deletedThought]);
 
   // ─────────────────────────────────────────────
@@ -552,24 +512,15 @@ export default function Dashboard() {
     if (!input.trim()) return;
     const now = Date.now();
     thoughtsRef.current.push({
-      id: now,
-      text: input,
+      id: now, text: input,
       x: 200 + Math.random() * (window.innerWidth - 400),
       y: 100 + Math.random() * (window.innerHeight - 200),
-      vx: 0, vy: 0,
-      connections: [],
-      createdAt: now,
-      updatedAt: now,
-      lastFocusedAt: now,
-      layer: 0,
-      depthProgress: 0,
-      opacity: 1,
-      blur: 0,
-      scale: 1,
-      saturation: 1,
+      vx: 0, vy: 0, connections: [],
+      createdAt: now, updatedAt: now, lastFocusedAt: now,
+      layer: 0, depthProgress: 0,
+      opacity: 1, blur: 0, scale: 1, saturation: 1,
     });
-    setInput("");
-    forceRender((n) => n + 1);
+    setInput(""); forceRender((n) => n + 1);
   };
 
   // ─────────────────────────────────────────────
@@ -579,24 +530,18 @@ export default function Dashboard() {
     e.stopPropagation();
     isDragging.current = false;
     if (longHoverTimer.current) clearTimeout(longHoverTimer.current);
-    setLongHoverId(null);
-    setShowColorPicker(null);
-
+    setLongHoverId(null); setShowColorPicker(null);
     dragLeaderIdRef.current = thought.id;
     leaderPosRef.current = { x: thought.x, y: thought.y };
     dragging.current = { id: thought.id, offsetX: e.clientX - thought.x, offsetY: e.clientY - thought.y };
-
     const onMove = (e: MouseEvent) => {
       if (!dragging.current) return;
       isDragging.current = true;
-      const { offsetX, offsetY } = dragging.current;
-      leaderPosRef.current = { x: e.clientX - offsetX, y: e.clientY - offsetY };
+      leaderPosRef.current = { x: e.clientX - dragging.current.offsetX, y: e.clientY - dragging.current.offsetY };
     };
     const onUp = () => {
       isDragging.current = false;
-      dragLeaderIdRef.current = null;
-      leaderPosRef.current = null;
-      dragging.current = null;
+      dragLeaderIdRef.current = null; leaderPosRef.current = null; dragging.current = null;
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
@@ -604,35 +549,29 @@ export default function Dashboard() {
     window.addEventListener("mouseup", onUp);
   }, []);
 
-  // ─────────────────────────────────────────────
   // 연결
-  // ─────────────────────────────────────────────
   const handleConnect = useCallback((fromId: number, toId: number) => {
     if (fromId === toId) return;
     thoughtsRef.current.forEach((t) => {
       if (t.id === fromId) {
-        const already = t.connections.includes(toId);
-        t.connections = already ? t.connections.filter((c) => c !== toId) : [...t.connections, toId];
+        const a = t.connections.includes(toId);
+        t.connections = a ? t.connections.filter((c) => c !== toId) : [...t.connections, toId];
       }
       if (t.id === toId) {
-        const already = t.connections.includes(fromId);
-        t.connections = already ? t.connections.filter((c) => c !== fromId) : [...t.connections, fromId];
+        const a = t.connections.includes(fromId);
+        t.connections = a ? t.connections.filter((c) => c !== fromId) : [...t.connections, fromId];
       }
     });
-    setConnecting(null);
-    forceRender((n) => n + 1);
+    setConnecting(null); forceRender((n) => n + 1);
   }, []);
 
-  // ─────────────────────────────────────────────
-  // 클릭
-  // ─────────────────────────────────────────────
   const handleThoughtClick = useCallback((thought: Thought) => {
     if (isDragging.current) return;
     const now = Date.now();
     const last = lastClickTime.current[thought.id] || 0;
-    const isDoubleClick = now - last < 300;
+    const isDbl = now - last < 300;
     lastClickTime.current[thought.id] = now;
-    if (isDoubleClick) { setConnecting(thought.id); return; }
+    if (isDbl) { setConnecting(thought.id); return; }
     if (connecting !== null) { handleConnect(connecting, thought.id); return; }
   }, [connecting, handleConnect]);
 
@@ -646,22 +585,15 @@ export default function Dashboard() {
     if (longHoverTimer.current) clearTimeout(longHoverTimer.current);
     if (hideTimer.current) clearTimeout(hideTimer.current);
     hideTimer.current = setTimeout(() => {
-      setLongHoverId(null);
-      setShowColorPicker(null);
-      setPreviewColor(null);
+      setLongHoverId(null); setShowColorPicker(null); setPreviewColor(null);
     }, 200);
   }, []);
 
-  // ─────────────────────────────────────────────
-  // 삭제 / 색상 / 그룹 해제
-  // ─────────────────────────────────────────────
   const handleDelete = useCallback((thought: Thought) => {
-    const index = thoughtsRef.current.findIndex((t) => t.id === thought.id);
-    setDeletedThought({ thought, index });
+    const idx = thoughtsRef.current.findIndex((t) => t.id === thought.id);
+    setDeletedThought({ thought, index: idx });
     thoughtsRef.current = thoughtsRef.current.filter((t) => t.id !== thought.id);
-    setLongHoverId(null);
-    setShowColorPicker(null);
-    setSelectedId(null);
+    setLongHoverId(null); setShowColorPicker(null); setSelectedId(null);
     forceRender((n) => n + 1);
     if (undoTimer.current) clearTimeout(undoTimer.current);
     undoTimer.current = setTimeout(() => setDeletedThought(null), 3000);
@@ -670,8 +602,7 @@ export default function Dashboard() {
   const handleColorChange = useCallback((id: number, color: string) => {
     const t = thoughtsRef.current.find((t) => t.id === id);
     if (t) t.color = color;
-    setShowColorPicker(null);
-    setPreviewColor(null);
+    setShowColorPicker(null); setPreviewColor(null);
     forceRender((n) => n + 1);
   }, []);
 
@@ -680,27 +611,21 @@ export default function Dashboard() {
       if (t.id === thought.id) t.connections = [];
       else t.connections = t.connections.filter((c) => c !== thought.id);
     });
-    setLongHoverId(null);
-    forceRender((n) => n + 1);
+    setLongHoverId(null); forceRender((n) => n + 1);
   }, []);
 
-  // ─────────────────────────────────────────────
-  // 패널 핸들러
-  // ─────────────────────────────────────────────
   const handlePanelTextSave = useCallback(() => {
     const t = thoughtsRef.current.find((t) => t.id === selectedId);
     if (t && panelEditText.trim()) {
-      t.text = panelEditText.trim();
-      t.updatedAt = Date.now();
+      t.text = panelEditText.trim(); t.updatedAt = Date.now();
       forceRender((n) => n + 1);
     }
   }, [selectedId, panelEditText]);
 
-  const handlePanelFocus = useCallback((targetId: number) => {
-    const target = thoughtsRef.current.find((t) => t.id === targetId);
-    if (!target) return;
-    target.lastFocusedAt = Date.now();
-    setSelectedId(targetId);
+  const handlePanelFocus = useCallback((tid: number) => {
+    const t = thoughtsRef.current.find((t) => t.id === tid);
+    if (t) t.lastFocusedAt = Date.now();
+    setSelectedId(tid);
   }, []);
 
   const formatTime = (ts?: number) => {
@@ -709,8 +634,40 @@ export default function Dashboard() {
   };
 
   // ─────────────────────────────────────────────
-  // 파생 데이터
+  // 3️⃣ 필터 적용 → 노드별 최종 opacity / blur / pointer-events
   // ─────────────────────────────────────────────
+  // 카메라 레이어와 노드 레이어의 거리에 따라 흐림 결정
+  // 거리 0 (같은 레이어) → 선명, 클릭 가능
+  // 거리 1 (한 단계 차이) → 조금 흐림
+  // 거리 2 (두 단계 차이) → 많이 흐림
+  const getNodeRender = (thought: Thought, baseOpacity: number, baseBlur: number) => {
+    // hudLayer는 React state → 렌더와 완전 동기화
+    const dist = Math.abs(thought.layer - hudLayer);
+
+    if (dist === 0) {
+      // 같은 레이어: aging 무시하고 항상 선명하게
+      return {
+        opacity: thought.id === selectedId ? 1.0 : 0.92,
+        blur: 0,
+        interactive: true,
+      };
+    }
+    if (dist === 1) {
+      return {
+        opacity: baseOpacity * 0.35,
+        blur: baseBlur + 4,
+        interactive: false,
+      };
+    }
+    // dist === 2
+    return {
+      opacity: baseOpacity * 0.1,
+      blur: baseBlur + 9,
+      interactive: false,
+    };
+  };
+
+  // 파생 데이터
   const selectedThought = thoughtsRef.current.find((t) => t.id === selectedId) ?? null;
   const connectedThoughts = selectedThought
     ? thoughtsRef.current.filter((t) => selectedThought.connections.includes(t.id))
@@ -721,7 +678,6 @@ export default function Dashboard() {
   const groupThoughts = thoughtsRef.current.filter(
     (t) => groupIds.includes(t.id) && t.id !== selectedThought?.id
   );
-
   const thoughts = thoughtsRef.current;
 
   // ─────────────────────────────────────────────
@@ -730,17 +686,11 @@ export default function Dashboard() {
   return (
     <div className="w-screen h-screen overflow-hidden relative bg-black">
 
-      {/* 배경 */}
-      <div className="absolute inset-0 pointer-events-none">
-        <DigitalLoomBackground threadColor="rgba(100, 100, 255, 0.05)" threadCount={30}>
-          <div />
-        </DigitalLoomBackground>
-      </div>
+
 
       {/* 연결선 캔버스 */}
       <canvas ref={canvasRef} className="absolute inset-0 w-full h-full pointer-events-none z-10" />
-
-      {/* 깊이/안개/입자 캔버스 */}
+      {/* 효과 캔버스 */}
       <canvas ref={zoomCanvasRef} className="fixed inset-0 w-full h-full pointer-events-none z-50" />
 
       {/* 빈 공간 클릭 → 패널 닫기 */}
@@ -748,92 +698,117 @@ export default function Dashboard() {
         <div className="fixed inset-0 z-10" onClick={() => setSelectedId(null)} />
       )}
 
-      {/* Thought 카드 목록 */}
+      {/* ══════════════════════════════════════
+          레이어 HUD (좌측 상단)
+      ══════════════════════════════════════ */}
+      <div className="fixed top-6 left-6 z-40 flex flex-col gap-2 select-none">
+
+        {/* 현재 레이어 HUD */}
+        <div
+          className="flex items-center gap-2.5 px-3.5 py-2 rounded-2xl backdrop-blur-md border border-white/10 bg-black/50"
+          style={{ transition: "opacity 120ms ease", opacity: hudVisible ? 1 : 0 }}
+        >
+          {/* 깊이 도트 인디케이터 */}
+          <div className="flex gap-1.5 items-center">
+            {([0, 1, 2] as const).map((i) => (
+              <div
+                key={i}
+                style={{
+                  width: hudLayer === i ? 9 : 5,
+                  height: hudLayer === i ? 9 : 5,
+                  borderRadius: "50%",
+                  background: hudLayer === i
+                    ? "rgba(190,175,255,1)"
+                    : "rgba(255,255,255,0.18)",
+                  boxShadow: hudLayer === i
+                    ? "0 0 7px rgba(170,150,255,0.8)"
+                    : "none",
+                  transition: "all 250ms ease",
+                }}
+              />
+            ))}
+          </div>
+          <span
+            className="text-xs tracking-widest font-light"
+            style={{ color: "rgba(200,185,255,0.85)" }}
+          >
+            {LAYER_NAMES[hudLayer]}
+          </span>
+        </div>
+      </div>
+
+      {/* ══════════════════════════════════════
+          Thought 카드
+      ══════════════════════════════════════ */}
       {thoughts.map((thought) => {
         const isLongHovered = longHoverId === thought.id;
         const isSelected = selectedId === thought.id;
         const isHovered = hoveredId === thought.id;
         const currentColor = previewColor && isLongHovered
-          ? previewColor
-          : (thought.color || "rgba(255,255,255,0.1)");
+          ? previewColor : (thought.color || "rgba(255,255,255,0.1)");
 
-        // 시각 상태 적용
-        const visualOpacity = isSelected ? 1 : thought.opacity;
-        const visualBlur = isSelected ? 0 : thought.blur;
-        const visualScale = isSelected
-          ? 1.08
-          : isHovered
-          ? Math.max(thought.scale, 1.0) * 1.06
-          : isLongHovered
-          ? thought.scale * 1.04
+        const baseOpacity = isSelected ? 1 : thought.opacity;
+        const baseBlur = isSelected ? 0 : thought.blur;
+        const { opacity, blur, interactive } = getNodeRender(thought, baseOpacity, baseBlur);
+
+        const visualScale = isSelected ? 1.08
+          : isHovered ? Math.max(thought.scale, 1.0) * 1.06
+          : isLongHovered ? thought.scale * 1.04
           : thought.scale;
-        const visualSaturation = thought.saturation;
 
         return (
           <div
             key={thought.id}
             className="absolute z-20"
             style={{
-              left: thought.x,
-              top: thought.y,
-              opacity: visualOpacity,
-              filter: `blur(${visualBlur}px) saturate(${visualSaturation})`,
+              left: thought.x, top: thought.y,
+              opacity,
+              filter: `blur(${blur}px) saturate(${thought.saturation})`,
               transition: "opacity 1.2s ease, filter 1.2s ease",
+              pointerEvents: interactive ? "auto" : "none",
             }}
             onMouseEnter={() => handleMouseEnter(thought)}
             onMouseLeave={handleMouseLeave}
           >
             {/* 퀵 액션 */}
-            {isLongHovered && (
+            {isLongHovered && interactive && (
               <div
                 className="absolute -top-9 left-0 flex gap-1 z-30"
                 style={{ animation: "fadeInUp 0.1s ease forwards" }}
                 onMouseEnter={() => { if (hideTimer.current) clearTimeout(hideTimer.current); }}
               >
                 <div className="flex gap-1 px-2 py-1 rounded-xl bg-black/60 border border-white/10 backdrop-blur-md">
-                  <button
-                    onClick={(e) => { e.stopPropagation(); handleDelete(thought); }}
-                    className="w-6 h-6 rounded-lg flex items-center justify-center text-white/50 hover:text-red-400 hover:bg-red-500/20 transition-all hover:scale-110 active:scale-95"
-                  >
+                  <button onClick={(e) => { e.stopPropagation(); handleDelete(thought); }}
+                    className="w-6 h-6 rounded-lg flex items-center justify-center text-white/50 hover:text-red-400 hover:bg-red-500/20 transition-all hover:scale-110 active:scale-95">
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <polyline points="3 6 5 6 21 6"/>
-                      <path d="M19 6l-1 14H6L5 6"/>
-                      <path d="M10 11v6M14 11v6"/>
+                      <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/>
                     </svg>
                   </button>
                   <div className="relative">
-                    <button
-                      onClick={(e) => { e.stopPropagation(); setShowColorPicker(showColorPicker === thought.id ? null : thought.id); }}
-                      className="w-6 h-6 rounded-lg flex items-center justify-center text-white/50 hover:text-purple-400 hover:bg-purple-500/20 transition-all hover:scale-110 active:scale-95"
-                    >
+                    <button onClick={(e) => { e.stopPropagation(); setShowColorPicker(showColorPicker === thought.id ? null : thought.id); }}
+                      className="w-6 h-6 rounded-lg flex items-center justify-center text-white/50 hover:text-purple-400 hover:bg-purple-500/20 transition-all hover:scale-110 active:scale-95">
                       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                         <circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="4"/>
                       </svg>
                     </button>
                     {showColorPicker === thought.id && (
-                      <div
-                        className="absolute top-8 left-0 flex gap-1.5 p-2 rounded-xl bg-black/70 border border-white/10 backdrop-blur-md z-40"
+                      <div className="absolute top-8 left-0 flex gap-1.5 p-2 rounded-xl bg-black/70 border border-white/10 backdrop-blur-md z-40"
                         style={{ animation: "scaleIn 0.1s ease forwards" }}
                         onClick={(e) => e.stopPropagation()}
-                        onMouseLeave={() => setPreviewColor(null)}
-                      >
-                        {PRESET_COLORS.map((color) => (
-                          <button
-                            key={color}
-                            onMouseEnter={() => setPreviewColor(color)}
+                        onMouseLeave={() => setPreviewColor(null)}>
+                        {PRESET_COLORS.map((c) => (
+                          <button key={c}
+                            onMouseEnter={() => setPreviewColor(c)}
                             onMouseLeave={() => setPreviewColor(null)}
-                            onClick={() => handleColorChange(thought.id, color)}
+                            onClick={() => handleColorChange(thought.id, c)}
                             className="w-5 h-5 rounded-full border border-white/20 hover:scale-125 transition-transform"
-                            style={{ background: color }}
-                          />
+                            style={{ background: c }} />
                         ))}
                       </div>
                     )}
                   </div>
-                  <button
-                    onClick={(e) => { e.stopPropagation(); handleUngroup(thought); }}
-                    className="w-6 h-6 rounded-lg flex items-center justify-center text-white/50 hover:text-orange-400 hover:bg-orange-500/20 transition-all hover:scale-110 active:scale-95"
-                  >
+                  <button onClick={(e) => { e.stopPropagation(); handleUngroup(thought); }}
+                    className="w-6 h-6 rounded-lg flex items-center justify-center text-white/50 hover:text-orange-400 hover:bg-orange-500/20 transition-all hover:scale-110 active:scale-95">
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                       <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
                       <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
@@ -847,28 +822,21 @@ export default function Dashboard() {
             {/* 카드 본체 */}
             <div
               className={`backdrop-blur-sm border rounded-2xl px-4 py-2 text-white text-sm select-none ${
-                connecting === thought.id
-                  ? "border-blue-400/50 cursor-crosshair"
-                  : connecting !== null
-                  ? "border-white/30 cursor-crosshair hover:border-blue-400/50"
-                  : "border-white/20 cursor-grab"
+                connecting === thought.id ? "border-blue-400/50 cursor-crosshair"
+                : connecting !== null ? "border-white/30 cursor-crosshair hover:border-blue-400/50"
+                : "border-white/20 cursor-grab"
               }`}
               style={{
                 background: currentColor,
                 transform: `scale(${visualScale})`,
                 boxShadow: isSelected
-                  ? `0 0 16px 4px ${thought.color
-                      ? thought.color.replace(/[\d.]+\)$/, "0.5)")
-                      : "rgba(100,100,255,0.45)"}`
-                  : isLongHovered
-                  ? "0 0 18px rgba(100,100,255,0.25)"
-                  : "none",
+                  ? `0 0 16px 4px ${thought.color ? thought.color.replace(/[\d.]+\)$/, "0.5)") : "rgba(100,100,255,0.45)"}`
+                  : isLongHovered ? "0 0 18px rgba(100,100,255,0.25)" : "none",
                 transition: "transform 180ms ease-out, box-shadow 220ms ease-out",
                 animation: "float 4s ease-in-out infinite",
               }}
               onMouseDown={(e) => {
                 setSelectedId(thought.id);
-                // 포커스 시간 갱신 (aging 완화)
                 const t = thoughtsRef.current.find((t) => t.id === thought.id);
                 if (t) t.lastFocusedAt = Date.now();
                 handleMouseDown(e, thought);
@@ -902,17 +870,11 @@ export default function Dashboard() {
 
       {/* 입력창 */}
       <div className="fixed bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-3 backdrop-blur-md bg-white/5 border border-white/10 rounded-full px-6 py-3 w-96 z-30">
-        <input
-          type="text"
-          value={input}
+        <input type="text" value={input}
           onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") addThought();
-            if (e.key === "Escape") setConnecting(null);
-          }}
+          onKeyDown={(e) => { if (e.key === "Enter") addThought(); if (e.key === "Escape") setConnecting(null); }}
           placeholder="Add a thought..."
-          className="bg-transparent text-white placeholder-gray-500 outline-none flex-1 text-sm"
-        />
+          className="bg-transparent text-white placeholder-gray-500 outline-none flex-1 text-sm" />
         <button onClick={addThought} className="text-white/60 hover:text-white transition-colors text-sm">＋</button>
       </div>
 
@@ -933,29 +895,24 @@ export default function Dashboard() {
 
             {/* 레이어 배지 */}
             <div className="flex gap-2 items-center">
-              {(["FRONT", "MID", "BACK"] as const).map((label, i) => (
-                <span
-                  key={label}
-                  className="text-xs px-2 py-0.5 rounded-full border"
+              {(["Fluent", "Latent", "Dormant"] as const).map((label, i) => (
+                <span key={label} className="text-xs px-2 py-0.5 rounded-full border"
                   style={{
                     borderColor: selectedThought.layer === i ? "rgba(150,130,255,0.5)" : "rgba(255,255,255,0.08)",
                     color: selectedThought.layer === i ? "rgba(200,185,255,0.9)" : "rgba(255,255,255,0.2)",
                     background: selectedThought.layer === i ? "rgba(120,100,255,0.15)" : "transparent",
-                  }}
-                >{label}</span>
+                  }}>{label}</span>
               ))}
             </div>
 
             <div className="flex flex-col gap-2">
               <span className="text-white/30 text-xs">Content</span>
-              <textarea
-                value={panelEditText}
+              <textarea value={panelEditText}
                 onChange={(e) => setPanelEditText(e.target.value)}
                 onBlur={handlePanelTextSave}
                 onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handlePanelTextSave(); } }}
                 className="bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-white text-sm outline-none resize-none focus:border-white/25 transition-colors"
-                rows={3}
-              />
+                rows={3} />
             </div>
 
             <div className="flex flex-col gap-1.5">
@@ -972,10 +929,9 @@ export default function Dashboard() {
               <span className="text-white/30 text-xs">
                 Connections <span className="text-white/20">({connectedThoughts.length})</span>
               </span>
-              {connectedThoughts.length === 0 ? (
-                <span className="text-white/20 text-xs">None</span>
-              ) : (
-                <div className="flex flex-col gap-1">
+              {connectedThoughts.length === 0
+                ? <span className="text-white/20 text-xs">None</span>
+                : <div className="flex flex-col gap-1">
                   {connectedThoughts.map((t) => (
                     <button key={t.id} onClick={() => handlePanelFocus(t.id)}
                       className="text-left px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 text-white/60 text-xs hover:text-white hover:bg-white/10 transition-all">
@@ -983,7 +939,7 @@ export default function Dashboard() {
                     </button>
                   ))}
                 </div>
-              )}
+              }
             </div>
 
             {groupThoughts.length > 0 && (
