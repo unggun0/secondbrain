@@ -22,6 +22,8 @@ interface Thought {
   blur: number;
   scale: number;
   saturation: number;
+  spawnScale: number;  // 생성 시 pop 애니메이션용
+  spawnedAt: number;   // 생성 시각
 }
 
 // ── Parallax Starfield 파티클 타입 ──
@@ -60,6 +62,200 @@ const computeVisuals = (layer: LayerIndex, progress: number) => {
   return { opacity: lerp(0.45, 0.25, progress), blur: lerp(4, 8, progress), scale: lerp(0.82, 0.72, progress), saturation: lerp(0.65, 0.55, progress) };
 };
 
+
+// ─────────────────────────────────────────────
+// Cognitive Load Minimap
+// ─────────────────────────────────────────────
+function CognitiveMinimap({
+  thoughts,
+  onLayerClick,
+  currentLayer = 0,
+  size = 80,
+}: {
+  thoughts: { layer: 0 | 1 | 2; connections: number[] }[];
+  onLayerClick: (layer: 0 | 1 | 2) => void;
+  currentLayer?: 0 | 1 | 2;
+  size?: number;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const animRef = useRef<number>(0);
+
+  // ── 과부하 지수 계산 ──
+  // CurrentLayerLoad = (NodesInLayer × 1.0) + (ConnectionsInLayer × 1.5)
+  // 레이어 가중치: Active=1.0, Emerging=0.7, Abyssal=0.3 (깊을수록 자연스러운 침전)
+  const layerWeights = [1.0, 0.7, 0.3];
+  const layerLoads = ([0, 1, 2] as const).map((l) => {
+    const nodes = thoughts.filter((t) => t.layer === l);
+    const nodeCount = nodes.length;
+    const connCount = nodes.reduce((sum, t) => sum + t.connections.length, 0) / 2;
+    const raw = nodeCount * 1.0 + connCount * 1.5;
+    return raw * layerWeights[l];
+  });
+
+  // 상태 판정: 현재 레이어 기준 가장 크게 반영
+  const getStatus = (load: number) =>
+    load < 30 ? "normal" : load < 60 ? "active" : "overload";
+
+  const layerStatuses = layerLoads.map(getStatus);
+  const currentLoad = layerLoads[currentLayer];
+  const currentStatus = getStatus(currentLoad);
+
+  // 상태별 색상
+  const statusColors: Record<string, [number, number, number]> = {
+    normal:   [120, 180, 255],
+    active:   [255, 180,  60],
+    overload: [255,  60,  60],
+  };
+
+  useEffect(() => {
+    const W = size, H = size;
+    const CX = W / 2, CY = H / 2;
+    const sc = size / 80;
+
+    const draw = () => {
+      const canvas = canvasRef.current;
+      if (!canvas) { animRef.current = requestAnimationFrame(draw); return; }
+      const ctx = canvas.getContext("2d")!;
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = W * dpr; canvas.height = H * dpr;
+      canvas.style.width = W + "px"; canvas.style.height = H + "px";
+      ctx.scale(dpr, dpr);
+      ctx.clearRect(0, 0, W, H);
+
+      const now = performance.now() / 1000;
+
+      const ellipses = [
+        { rx: 32 * sc, ry: 22 * sc, z: 0 as const },
+        { rx: 22 * sc, ry: 15 * sc, z: 1 as const },
+        { rx: 11 * sc, ry:  8 * sc, z: 2 as const },
+      ];
+
+      ellipses.forEach(({ rx, ry, z }) => {
+        const load = layerLoads[z];
+        const status = layerStatuses[z];
+        const [cr, cg, cb] = statusColors[status];
+        const isCurrent = z === currentLayer;
+
+        // 과부하 강도 (0~1)
+        const intensity = Math.min(load / 60, 1);
+
+        // 박동 속도: normal=느림, active=보통, overload=빠름+떨림
+        const pulseSpeed = status === "normal" ? 1.2 : status === "active" ? 2.5 : 5.0;
+        const pulse = 0.55 + 0.45 * Math.sin(now * pulseSpeed + z * 1.1);
+
+        // overload: 미세 떨림
+        const shake = status === "overload"
+          ? Math.sin(now * 28 + z) * 1.5 * sc
+          : 0;
+
+        // glow (상태별 색 가스)
+        if (intensity > 0.05) {
+          const glowAlpha = intensity * (isCurrent ? 0.45 : 0.2) * pulse;
+          const grd = ctx.createRadialGradient(
+            CX + shake, CY + shake * 0.5, 0,
+            CX, CY, rx * 1.6
+          );
+          grd.addColorStop(0, `rgba(${cr},${cg},${cb},${glowAlpha})`);
+          grd.addColorStop(1, "rgba(0,0,0,0)");
+          ctx.fillStyle = grd;
+          ctx.beginPath();
+          ctx.ellipse(CX + shake, CY + shake * 0.5, rx * 1.5, ry * 1.5, 0, 0, Math.PI * 2);
+          ctx.fill();
+        }
+
+        // overload: 빨간 가스 추가 레이어
+        if (status === "overload") {
+          const gasAlpha = 0.15 + 0.1 * Math.sin(now * 3.5 + z * 2);
+          const gasGrd = ctx.createRadialGradient(CX, CY, rx * 0.3, CX, CY, rx * 1.8);
+          gasGrd.addColorStop(0, `rgba(255,40,40,${gasAlpha})`);
+          gasGrd.addColorStop(0.6, `rgba(200,20,20,${gasAlpha * 0.5})`);
+          gasGrd.addColorStop(1, "rgba(0,0,0,0)");
+          ctx.fillStyle = gasGrd;
+          ctx.beginPath();
+          ctx.ellipse(CX + shake, CY + shake * 0.5, rx * 1.8, ry * 1.8, 0, 0, Math.PI * 2);
+          ctx.fill();
+        }
+
+        // active: 스파크 (신경 발화)
+        if (status === "active" || status === "overload") {
+          const sparkCount = status === "overload" ? 6 : 3;
+          for (let i = 0; i < sparkCount; i++) {
+            const angle = (now * 1.8 + i * (Math.PI * 2 / sparkCount) + z) % (Math.PI * 2);
+            const sparkR = rx * (0.8 + 0.2 * Math.sin(now * 3 + i));
+            const sx = CX + Math.cos(angle) * sparkR;
+            const sy = CY + Math.sin(angle) * sparkR * (ry / rx);
+            const sparkAlpha = (0.4 + 0.6 * Math.sin(now * 4 + i * 1.7)) * intensity;
+            ctx.beginPath();
+            ctx.arc(sx, sy, 1.2 * sc, 0, Math.PI * 2);
+            ctx.fillStyle = `rgba(${cr},${cg},${cb},${sparkAlpha})`;
+            ctx.fill();
+          }
+        }
+
+        // 타원 테두리
+        ctx.beginPath();
+        ctx.ellipse(CX + shake, CY + shake * 0.5, rx, ry, 0, 0, Math.PI * 2);
+        const strokeAlpha = (isCurrent ? 0.55 : 0.2) * (0.7 + 0.3 * pulse);
+        ctx.strokeStyle = `rgba(${cr},${cg},${cb},${strokeAlpha})`;
+        ctx.lineWidth = isCurrent ? 1.2 : 0.6;
+        ctx.stroke();
+
+        // 수평선 (뇌 주름)
+        ctx.beginPath();
+        ctx.moveTo(CX - rx + shake, CY + shake * 0.3);
+        ctx.lineTo(CX + rx + shake, CY + shake * 0.3);
+        ctx.strokeStyle = `rgba(${cr},${cg},${cb},${strokeAlpha * 0.25})`;
+        ctx.lineWidth = 0.5;
+        ctx.stroke();
+      });
+
+      // 수직 연결선
+      ctx.beginPath();
+      ctx.moveTo(CX, CY - 28 * sc);
+      ctx.lineTo(CX, CY + 28 * sc);
+      ctx.strokeStyle = `rgba(180,180,255,0.1)`;
+      ctx.lineWidth = 0.5;
+      ctx.stroke();
+
+      // 상태 텍스트 + 노드 수
+      const total = thoughts.length;
+      const statusLabel = currentStatus === "normal" ? "calm"
+        : currentStatus === "active" ? "active" : "overload";
+      const [lr, lg, lb] = statusColors[currentStatus];
+      ctx.fillStyle = `rgba(${lr},${lg},${lb},0.5)`;
+      ctx.font = `${6 * sc}px sans-serif`;
+      ctx.textAlign = "center";
+      ctx.fillText(`${statusLabel} · ${total}`, CX, H - 3);
+
+      animRef.current = requestAnimationFrame(draw);
+    };
+
+    animRef.current = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(animRef.current);
+  }, [layerLoads, layerStatuses, currentLayer, currentStatus, size]);
+
+  const sc = size / 80;
+  return (
+    <div className="flex flex-col items-center gap-1.5">
+      <span className="text-[8px] uppercase tracking-[0.2em] text-white/25 font-light">Mind</span>
+      <div className="relative" style={{ width: size, height: size }}>
+        <canvas ref={canvasRef} style={{ width: size, height: size }} />
+        {([0, 1, 2] as const).map((l) => {
+          const bs = [{ w: 64*sc, h: 44*sc }, { w: 44*sc, h: 30*sc }, { w: 22*sc, h: 16*sc }];
+          const b = bs[l];
+          return (
+            <button key={l} onClick={() => onLayerClick(l)}
+              className="absolute rounded-full hover:bg-white/5 transition-colors"
+              style={{ width: b.w, height: b.h, left: (size - b.w) / 2, top: (size - b.h) / 2 }}
+              title={["Active", "Emerging", "Abyssal"][l]}
+            />
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 // ─────────────────────────────────────────────
 // 메인 컴포넌트
 // ─────────────────────────────────────────────
@@ -81,8 +277,9 @@ export default function Dashboard() {
   const [hudLayer, setHudLayer] = useState<LayerIndex>(0);
   const [hudVisible, setHudVisible] = useState(true);
   const [bgOpacity, setBgOpacity] = useState(0.85);
-  const bgOpacityRef = useRef(0.85);       // lerp용 실제값
-  const bgOpacityTargetRef = useRef(0.85); // 슬라이더 목표값
+  const bgOpacityRef = useRef(0.85);
+  const bgOpacityTargetRef = useRef(0.85);
+  const overloadLevelRef = useRef(0); // 0=normal, 1=active, 2=overload — 파티클 속도 연동
 
   // ── Parallax Starfield 캔버스 ──
   const starCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -110,6 +307,8 @@ export default function Dashboard() {
   const camLayerRef = useRef<LayerIndex>(0);
   const particlesRef = useRef<{ x: number; y: number; vx: number; vy: number; alpha: number; size: number; life: number }[]>([]);
   const transitionRef = useRef({ active: false, phase: 0, startTime: 0 });
+  // 뉴런 발화 궤적
+  const spawnTrailsRef = useRef<{ x1: number; y1: number; x2: number; y2: number; createdAt: number }[]>([]);
 
   // ─────────────────────────────────────────────
   // 파티클 구체 배경 (랜딩과 동일한 감도, Canvas 2D)
@@ -290,7 +489,15 @@ export default function Dashboard() {
       });
 
       // 천천히 회전 (랜딩의 0.0005와 동일한 속도감)
-      rotY.current -= 0.00045;
+      // 과부하 레벨에 따라 회전 속도 + 불규칙성 증가
+      const ol = overloadLevelRef.current;
+      const baseSpeed = 0.00045;
+      const overloadSpeed = ol === 2
+        ? baseSpeed * (2.5 + Math.sin(performance.now() * 0.003) * 1.2) // overload: 불규칙
+        : ol === 1
+        ? baseSpeed * 1.6  // active: 빠름
+        : baseSpeed;       // normal: 평상시
+      rotY.current -= overloadSpeed;
       starAnimRef.current = requestAnimationFrame(draw);
     };
 
@@ -351,12 +558,13 @@ export default function Dashboard() {
       // Breath 전환: 0.8초 dimming (레이어 전환 시)
       if (transitionRef.current.active) {
         const t = Math.min((performance.now() - transitionRef.current.startTime) / 800, 1);
-        // 0→0.5: 살짝 어두워짐, 0.5→1: 원래대로
         const dimAlpha = Math.sin(t * Math.PI) * 0.12;
         ctx.fillStyle = `rgba(0,0,0,${dimAlpha})`;
         ctx.fillRect(0, 0, canvas.width, canvas.height);
         if (t >= 1) transitionRef.current.active = false;
       }
+
+      const nowMs = Date.now();
 
       fid = requestAnimationFrame(loop);
     };
@@ -412,6 +620,52 @@ export default function Dashboard() {
         t.blur = isFocused ? 0 : v.blur;
         t.scale = v.scale + (isFocused ? 0.08 : 0);
         t.saturation = v.saturation + (isFocused ? 0.3 : 0);
+
+        // spawn scale pop: 0 → 1.4 → 1.0 elastic (600ms) — spawnedAt 도달 후 시작
+        if (!t.spawnScale) t.spawnScale = 0;
+        if (t.spawnScale < 0.999) {
+          const elapsed = now - t.spawnedAt;
+          if (elapsed < 0) {
+            t.spawnScale = 0; // 아직 날아가는 중
+          } else {
+            const p = Math.min(elapsed / 600, 1);
+            const elastic = p === 1 ? 1
+              : 1 - Math.pow(2, -10 * p) * Math.cos(p * Math.PI * 2.5);
+            t.spawnScale = Math.max(0, elastic);
+          }
+        } else {
+          t.spawnScale = 1;
+        }
+
+        // 날아가는 중: 타겟으로 spring 이동 + scale 0.2→1.0
+        if (t.spawnedAt > now) {
+          // 초기 타겟 저장
+          if (!(t as any)._tx) {
+            (t as any)._tx = t.x + t.vx * 8;
+            (t as any)._ty = t.y + t.vy * 8;
+          }
+          const tx = (t as any)._tx, ty = (t as any)._ty;
+          const tdx = tx - t.x, tdy = ty - t.y;
+          const tdist = Math.sqrt(tdx * tdx + tdy * tdy);
+
+          // scale: 거리 기반 0.2→1.0
+          const W2 = window.innerWidth, H2 = window.innerHeight;
+          const startDist = Math.sqrt(Math.pow(tx - W2/2, 2) + Math.pow(ty - (H2-80), 2));
+          t.spawnScale = lerp(0.2, 1.0, Math.max(0, 1 - tdist / (startDist || 1)));
+
+          if (tdist > 6) {
+            // 타겟 방향으로 강하게 당기기
+            t.vx = t.vx * 0.7 + (tdx / tdist) * Math.min(tdist * 0.4, 28);
+            t.vy = t.vy * 0.7 + (tdy / tdist) * Math.min(tdist * 0.4, 28);
+            t.x += t.vx; t.y += t.vy;
+          } else {
+            // 도달 — ring 효과 시작
+            t.x = tx; t.y = ty;
+            t.vx = 0; t.vy = 0;
+            t.spawnScale = 1;
+            t.spawnedAt = now; // ring 트리거
+          }
+        }
       });
 
       // Radial Push
@@ -456,19 +710,18 @@ export default function Dashboard() {
         t.vx = (t.vx + fx) * DAMPING;
         t.vy = (t.vy + fy) * DAMPING;
         t.x += t.vx; t.y += t.vy;
-        // 화면 경계 바운스
-      const margin = 60;
-        if (t.x < margin) { t.x = margin; t.vx *= -0.3; }
-        if (t.x > window.innerWidth - margin) { t.x = window.innerWidth - margin; t.vx *= -0.3; }
-        if (t.y < margin) { t.y = margin; t.vy *= -0.3; }
-        if (t.y > window.innerHeight - margin) { t.y = window.innerHeight - margin; t.vy *= -0.3; }
       });
-
-    
 
       // 반발 움직임 있을 때만 리렌더
       const hasMotion = thoughts.some(t => Math.abs(t.vx) > 0.01 || Math.abs(t.vy) > 0.01);
       if (hasMotion) forceRender((n) => n + 1);
+
+      // 현재 레이어 과부하 지수 계산 → overloadLevelRef 업데이트
+      const curLayer = camLayerRef.current;
+      const curNodes = thoughts.filter(t => t.layer === curLayer);
+      const curConns = curNodes.reduce((sum, t) => sum + t.connections.length, 0) / 2;
+      const load = curNodes.length * 1.0 + curConns * 1.5;
+      overloadLevelRef.current = load < 30 ? 0 : load < 60 ? 1 : 2;
 
       // Physics
       if (leaderId && leaderPos) {
@@ -547,13 +800,26 @@ export default function Dashboard() {
   const addThought = () => {
     if (!input.trim()) return;
     const now = Date.now();
+    const W = window.innerWidth, H = window.innerHeight;
+    // 시작: 입력창 위치 (하단 중앙)
+    const startX = W / 2;
+    const startY = H - 80;
+    // 타겟: 중앙 근처 랜덤
+    const targetX = W * 0.3 + Math.random() * W * 0.4;
+    const targetY = H * 0.2 + Math.random() * H * 0.45;
+    // 빠른 발사 (전기 신호 느낌 — dist/8로 빠르게)
+    const dx = targetX - startX, dy = targetY - startY;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const speed = dist / 8;
     thoughtsRef.current.push({
       id: now, text: input,
-      x: 200 + Math.random() * (window.innerWidth - 400),
-      y: 100 + Math.random() * (window.innerHeight - 200),
-      vx: 0, vy: 0, connections: [],
+      x: startX, y: startY,
+      vx: (dx / dist) * speed,
+      vy: (dy / dist) * speed,
+      connections: [],
       createdAt: now, updatedAt: now, lastFocusedAt: now,
       layer: 0, depthProgress: 0, opacity: 1, blur: 0, scale: 1, saturation: 1,
+      spawnScale: 0, spawnedAt: now + 99999, // 도착 전까지 pop 안 터짐
     });
     setInput(""); forceRender((n) => n + 1);
   };
@@ -694,6 +960,26 @@ export default function Dashboard() {
                 {LAYER_NAMES[hudLayer]}
               </span>
             </div>
+            {/* Ambient 슬라이더 — HUD 바로 아래 */}
+            <div className="flex items-center gap-3 px-1 opacity-40 hover:opacity-100 transition-opacity duration-500">
+              <span className="text-[8px] uppercase tracking-[0.2em] text-white/35 font-light w-12">Ambient</span>
+              <input
+                type="range" min="0" max="1" step="0.01"
+                value={bgOpacity}
+                onChange={(e) => {
+                  const v = parseFloat(e.target.value);
+                  setBgOpacity(v);
+                  bgOpacityTargetRef.current = v;
+                }}
+                className="w-20 cursor-pointer"
+                style={{
+                  WebkitAppearance: "none", appearance: "none",
+                  height: "1px",
+                  background: `linear-gradient(to right, rgba(255,255,255,0.6) ${bgOpacity * 100}%, rgba(255,255,255,0.12) ${bgOpacity * 100}%)`,
+                  outline: "none", border: "none",
+                }}
+              />
+            </div>
           </div>
 
           {/* Thought 카드 */}
@@ -702,8 +988,10 @@ export default function Dashboard() {
             const isSelected = selectedId === thought.id;
             const isHovered = hoveredId === thought.id;
             const currentColor = previewColor && isLongHovered ? previewColor : (thought.color || "rgba(255,255,255,0.1)");
-            const { opacity, blur, interactive, glow } = getNodeRender(thought, isSelected ? 1 : thought.opacity, isSelected ? 0 : thought.blur);
-            const visualScale = isSelected ? 1.08 : isHovered ? Math.max(thought.scale, 1.0) * 1.02 : isLongHovered ? thought.scale * 1.02 : thought.scale;
+            const isSpawning = (thought.spawnScale ?? 1) < 0.999;
+            const { opacity, blur, interactive, glow } = getNodeRender(thought, isSelected || isSpawning ? 1 : thought.opacity, isSelected || isSpawning ? 0 : thought.blur);
+            const spawnS = thought.spawnScale ?? 1;
+            const visualScale = (isSelected ? 1.08 : isHovered ? Math.max(thought.scale, 1.0) * 1.02 : isLongHovered ? thought.scale * 1.02 : thought.scale) * spawnS;
             const glowColor = thought.color ? thought.color.replace(/[\d.]+\)$/, "0.6)") : hudLayer === 0 ? "rgba(180,200,255,0.5)" : hudLayer === 1 ? "rgba(140,100,255,0.5)" : "rgba(80,100,255,0.55)";
             const boxShadowValue = isSelected
               ? `0 0 24px 8px ${glowColor}, 0 0 48px 12px ${glowColor.replace("0.6)", "0.2)")}`
@@ -762,29 +1050,16 @@ export default function Dashboard() {
             </div>
           )}
 
-          {/* Ambient 컨트롤러 */}
-          <div className="fixed bottom-8 left-8 z-30 flex flex-col gap-2 opacity-20 hover:opacity-100 transition-opacity duration-500">
-            <span className="text-[9px] uppercase tracking-[0.25em] text-white/40 font-light">Ambient</span>
-            <div className="flex items-center gap-3">
-              <input
-                type="range" min="0" max="1" step="0.01"
-                value={bgOpacity}
-                onChange={(e) => {
-                  const v = parseFloat(e.target.value);
-                  setBgOpacity(v);
-                  bgOpacityTargetRef.current = v;
-                }}
-                className="w-20 cursor-pointer"
-                style={{
-                  WebkitAppearance: "none",
-                  appearance: "none",
-                  height: "1px",
-                  background: `linear-gradient(to right, rgba(255,255,255,0.7) ${bgOpacity * 100}%, rgba(255,255,255,0.15) ${bgOpacity * 100}%)`,
-                  outline: "none",
-                  border: "none",
-                }}
-              />
-            </div>
+          {/* 좌측 하단: Mind Minimap (크게) */}
+          <div className="fixed bottom-8 left-8 z-30 opacity-78 hover:opacity-100 transition-opacity duration-500">
+            <CognitiveMinimap
+              size={220}
+              thoughts={thoughtsRef.current}
+              currentLayer={hudLayer}
+              onLayerClick={(layer) => {
+                camTargetRef.current = layer === 0 ? 0 : layer === 1 ? 1.2 : 2.2;
+              }}
+            />
           </div>
 
           {/* 입력창 */}
@@ -797,9 +1072,9 @@ export default function Dashboard() {
 
           {/* 우측 상세 패널 */}
           <div className="fixed top-0 right-0 h-full w-72 z-40 pointer-events-none"
-            style={{ transform: selectedThought ? "translateX(0)" : "translateX(100%)", transition: "transform 250ms cubic-bezier(0.4,0,0.2,1)" }}>
+            style={{ transform: selectedThought ? "translateX(0)" : "translateX(100%)", transition: "transform 300ms cubic-bezier(0.4,0,0.2,1)" }}>
             {selectedThought && (
-              <div className="pointer-events-auto h-full flex flex-col gap-4 p-5 border-l border-white/10 bg-black/60 backdrop-blur-xl overflow-y-auto">
+              <div className="pointer-events-auto h-full flex flex-col gap-4 p-5 border-l border-white/[0.07] bg-white/[0.03] backdrop-blur-2xl overflow-y-auto">
                 <div className="flex items-center justify-between">
                   <span className="text-white/30 text-xs tracking-tighter uppercase font-light">Detail</span>
                   <button onClick={() => setSelectedId(null)} className="text-white/30 hover:text-white/70 transition-colors text-lg leading-none">×</button>
