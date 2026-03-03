@@ -52,7 +52,7 @@ const computeVisuals = (layer: LayerIndex, progress: number) => {
 // ParticleSphere
 // ─────────────────────────────────────────────
 function ParticleSphere({ camDepth }: { camDepth: React.MutableRefObject<number> }) {
-  const PARTICLE_COUNT = 600;
+  const PARTICLE_COUNT = 320;
   const SPHERE_RADIUS = 9;
   const ROTATION_SPEED_Y = 0.0005;
   const groupRef = useRef<THREE.Group>(null);
@@ -476,7 +476,7 @@ export default function Dashboard() {
   }, [selectedId]);
 
   useEffect(() => {
-    const STIFFNESS = 0.08, DAMPING = 0.93, MIN_DIST = 110, DENSITY_FACTOR = 0.7;
+    const STIFFNESS = 0.08, DAMPING = 0.93, MIN_DIST = 50, DENSITY_FACTOR = 0.7;
     const loop = () => {
       const now = Date.now();
       const thoughts = thoughtsRef.current;
@@ -560,21 +560,53 @@ export default function Dashboard() {
       });
       const visibleIds = new Set(sorted.slice(0, maxVisible).map((t) => t.id));
 
+      // ── Spatial Grid 반발력 계산 ──
+      const CELL = MIN_DIST; // 셀 크기 = 반발 거리
+      const PW = window.innerWidth, PH = window.innerHeight;
+      const cols = Math.ceil(PW / CELL), rows = Math.ceil(PH / CELL);
+      const grid: Map<number, Thought[]> = new Map();
+
+      // 각 노드를 격자 셀에 등록
+      thoughts.forEach((t) => {
+        const col = Math.floor(t.x / CELL), row = Math.floor(t.y / CELL);
+        const key = row * cols + col;
+        if (!grid.has(key)) grid.set(key, []);
+        grid.get(key)!.push(t);
+      });
+
       thoughts.forEach((t) => {
         if (t.id === dragLeaderIdRef.current) return;
         let fx = 0, fy = 0;
-        thoughts.forEach((o) => {
-          if (o.id === t.id) return;
-          const rx = t.x - o.x, ry = t.y - o.y;
-          const rd = Math.sqrt(rx * rx + ry * ry);
-          if (rd < MIN_DIST && rd > 0) {
-            const force = (MIN_DIST - rd) / rd * 0.018;
-            fx += rx * force; fy += ry * force;
+        const col = Math.floor(t.x / CELL), row = Math.floor(t.y / CELL);
+
+        // 인접 3×3 셀만 확인
+        for (let dr = -1; dr <= 1; dr++) {
+          for (let dc = -1; dc <= 1; dc++) {
+            const key = (row + dr) * cols + (col + dc);
+            const neighbors = grid.get(key);
+            if (!neighbors) continue;
+            neighbors.forEach((o) => {
+              if (o.id === t.id) return;
+              const rx = t.x - o.x, ry = t.y - o.y;
+              const rd = Math.sqrt(rx * rx + ry * ry);
+              if (rd < MIN_DIST && rd > 0) {
+                const force = (MIN_DIST - rd) / rd * 0.006;
+                fx += rx * force; fy += ry * force;
+              }
+            });
           }
-        });
+        }
+
         t.vx = (t.vx + fx) * DAMPING;
         t.vy = (t.vy + fy) * DAMPING;
         t.x += t.vx; t.y += t.vy;
+
+        // 화면 가장자리 바운드
+        const PAD = 12;
+        if (t.x < PAD) { t.x = PAD; t.vx *= -0.3; }
+        if (t.x > PW - PAD) { t.x = PW - PAD; t.vx *= -0.3; }
+        if (t.y < PAD) { t.y = PAD; t.vy *= -0.3; }
+        if (t.y > PH - PAD) { t.y = PH - PAD; t.vy *= -0.3; }
       });
 
       const hasMotion = thoughts.some(t => Math.abs(t.vx) > 0.01 || Math.abs(t.vy) > 0.01);
@@ -616,7 +648,7 @@ export default function Dashboard() {
           th.connections.forEach((tid) => {
             const tg = thoughts.find((t) => t.id === tid);
             if (!tg || tid < th.id || !visibleIds.has(tid) || tg.opacity < 0.04) return;
-            const x1 = th.x + 40, y1 = th.y + 16, x2 = tg.x + 40, y2 = tg.y + 16;
+            if (th.layer !== hudLayer || tg.layer !== hudLayer) return;            const x1 = th.x + 40, y1 = th.y + 16, x2 = tg.x + 40, y2 = tg.y + 16;
             const len = Math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2); if (len < 1) return;
             const dx = (x2 - x1) / len, dy = (y2 - y1) / len;
             const density = Math.max(8, Math.floor(len / 18));
@@ -764,11 +796,17 @@ export default function Dashboard() {
     return new Date(ts).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
   };
 
-  const getNodeRender = (thought: Thought, baseOpacity: number, baseBlur: number) => {
-    const dist = Math.abs(thought.layer - hudLayer);
-    if (dist === 0) return { opacity: thought.id === selectedId ? 1.0 : 0.92, blur: 0, interactive: true, glow: true };
-    if (dist === 1) return { opacity: baseOpacity * 0.28, blur: 15, interactive: false, glow: false };
-    return { opacity: baseOpacity * 0.07, blur: 28, interactive: false, glow: false };
+const getNodeRender = (thought: Thought, baseOpacity: number, baseBlur: number) => {
+    const diff = thought.layer - hudLayer;
+
+    // 현재 레이어: 완전히 선명
+    if (diff === 0) return { opacity: thought.id === selectedId ? 1.0 : 0.92, blur: 0, interactive: true, glow: true };
+
+    // 위 레이어(깊은 곳): 완전 숨김
+    if (diff > 0) return { opacity: 0, blur: 0, interactive: false, glow: false };
+
+    // 아래 레이어(얕은 곳): 완전 숨김
+    return { opacity: 0, blur: 0, interactive: false, glow: false };
   };
 
   const selectedThought = thoughtsRef.current.find((t) => t.id === selectedId) ?? null;
@@ -799,7 +837,7 @@ export default function Dashboard() {
         {selectedId !== null && <div className="fixed inset-0 z-10" onClick={() => setSelectedId(null)} />}
 
         {/* 레이어 HUD */}
-        <div className="fixed top-6 left-6 z-40 flex flex-col gap-2 select-none">
+        <div className="fixed top-6 left-6 z-60 flex flex-col gap-2 select-none">
           <div
             className="flex items-center gap-2.5 px-3.5 py-2 rounded-2xl backdrop-blur-md border border-white/10 bg-black/50"
             style={{ transition: "opacity 120ms ease", opacity: hudVisible ? 1 : 0 }}
